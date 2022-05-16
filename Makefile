@@ -1,6 +1,6 @@
 CC=gcc
-CFLAGS=-O3 -flto -fdata-sections -ffunction-sections -Wall
-LDFLAGS=-s -static -Wl,--gc-sections -Wl,--strip-all
+CFLAGS=-std=c18 -Wall -flto -Os -fdata-sections -ffunction-sections
+LDFLAGS=-flto -s -static -Wl,--gc-sections -Wl,--strip-all -Wl,-z,norelro -Wl,--build-id=none -Wl,-O1
 
 all: no80
 

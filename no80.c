@@ -1,24 +1,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <alloca.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <signal.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <stdnoreturn.h>
 
-#define QUEUE_LENGTH 8192
+#define QUEUE_LENGTH 1000
 
 enum command { REDIRECT, PERMADIRECT};
 
-void interrupted(int sig)
+/* signal handler */
+noreturn void interrupted(int sig)
 {
     puts("interrupted - exiting.");
-    _exit(0);
+    _exit(0); /* handler safe exit closes open sockets */
 }
 
+/* returns responseSize and puts http response buffer into given response pointer */
 int build_response(enum command cmd, const char *url, char **response)
 {
     const char *template = NULL;
@@ -36,7 +37,7 @@ int build_response(enum command cmd, const char *url, char **response)
                    "\r\n";
     }
     int responseMax = strlen(template) + strlen(url); /* note: template has 2 extra characters */
-    *response = malloc(responseMax+1); /* allocated once, never freed */
+    *response = malloc(responseMax+1); /* allocated once, kernel will free */
     int responseSize = snprintf(*response, responseMax, template, url);
     if (responseSize < 0) {
         perror("snprintf");
@@ -45,6 +46,7 @@ int build_response(enum command cmd, const char *url, char **response)
     return responseSize;
 }
 
+/* returns listen socket fd */
 int listen_socket(int port)
 {
     /* prepare socket */
@@ -56,7 +58,7 @@ int listen_socket(int port)
 
     /* enable address and port reusage */
     int option = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &option, sizeof(option))) {
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option))) {
         perror("setsockopt");
         exit(2);
     }
@@ -81,7 +83,7 @@ int listen_socket(int port)
     return fd;
 }
 
-int server(int port, enum command cmd, const char *url)
+noreturn void server(int port, enum command cmd, const char *url)
 {
     /* build http response */
     char *response;
@@ -95,6 +97,7 @@ int server(int port, enum command cmd, const char *url)
         /* accept connection */
         int rfd = accept(fd, NULL, NULL);
         if (rfd == -1) {
+            /* retry accept for these errnos */
             switch (errno) {
             case EAGAIN:
             case EINPROGRESS:
@@ -125,6 +128,7 @@ int server(int port, enum command cmd, const char *url)
 int main(int argc, char **argv)
 {
     signal(SIGINT, interrupted);
+    signal(SIGTERM, interrupted);
 
     if (argc != 3) {
         puts("Usage: no80 redirect URL");
@@ -148,5 +152,5 @@ int main(int argc, char **argv)
 
     puts("no80 - the resource effective redirecting http server");
     printf("%sing port %d to %s\n", cmdstr, port, url);
-    return server(port, cmd, url);
+    server(port, cmd, url);
 }

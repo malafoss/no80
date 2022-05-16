@@ -8,7 +8,7 @@ http redirects than, for example, nginx. The docker image size is under one mega
 
 ## Using container image
 
-Docker repository is available at [https://registry.hub.docker.com/r/malafoss/no80](https://registry.hub.docker.com/r/malafoss/no80).
+Docker repository is available at [https://hub.docker.com/r/malafoss/no80](https://hub.docker.com/r/malafoss/no80).
 
 To run the latest container:
 

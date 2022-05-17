@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <stdnoreturn.h>
 
 #define QUEUE_LENGTH 1000
@@ -56,9 +57,16 @@ int listen_socket(int port)
         exit(2);
     }
 
-    /* enable address and port reusage */
-    int option = 1;
+    /* enable address reusage */
+    int option = 1; /* enable */
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option))) {
+        perror("setsockopt");
+        exit(2);
+    }
+
+    /* enable deferred accept */
+    option = 3; /* seconds */
+    if (setsockopt(fd, SOL_TCP, TCP_DEFER_ACCEPT, &option, sizeof(option))) {
         perror("setsockopt");
         exit(2);
     }

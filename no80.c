@@ -58,28 +58,46 @@ int listen_socket(int port)
     }
 
     /* enable address reusage */
-    int option = 1; /* enable */
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option))) {
-        perror("setsockopt");
-        exit(2);
+    {
+        int option = 1; /* enable */
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option))) {
+            perror("setsockopt");
+            exit(2);
+        }
+    }
+
+    /* enable lingering close */
+    {
+        struct linger option;
+	bzero(&option, sizeof(option));
+        option.l_onoff = 1;
+	option.l_linger = 1; /* seconds */
+        if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option))) {
+            perror("setsockopt");
+            exit(2);
+        }
     }
 
     /* enable deferred accept */
-    option = 3; /* seconds */
-    if (setsockopt(fd, SOL_TCP, TCP_DEFER_ACCEPT, &option, sizeof(option))) {
-        perror("setsockopt");
-        exit(2);
+    {
+        int option = 1; /* seconds */
+        if (setsockopt(fd, SOL_TCP, TCP_DEFER_ACCEPT, &option, sizeof(option))) {
+            perror("setsockopt");
+            exit(2);
+	}
     }
 
     /* bind the port */
-    struct sockaddr_in address;
-    bzero(&address, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr*)&address, sizeof(address)) == -1) {
-        perror("bind");
-        exit(2);
+    {
+        struct sockaddr_in address;
+	bzero(&address, sizeof(address));
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = INADDR_ANY;
+	address.sin_port = htons(port);
+	if (bind(fd, (struct sockaddr*)&address, sizeof(address)) == -1) {
+            perror("bind");
+	    exit(2);
+	}
     }
 
     /* list the port */

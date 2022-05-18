@@ -5,7 +5,7 @@ echo Building no80 image
 . ./build.sh
 
 echo Start no80 container
-container=`$builder run -d -p $testport:80 no80 redirect https://example.com`
+container=`$builder run -d -p $testport:80 no80 https://example.com`
 echo $container
 
 echo Test1: redirect to example.com

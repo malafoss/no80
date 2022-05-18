@@ -1,6 +1,6 @@
 # no80
 
-no80 - the resource effective redirecting http server
+no80 - The resource effective redirecting http server
 
 No80 is a minimal dockerized http server that only makes redirects temporarily (302) or permanently (301)
 to a given URL. Often used to redirect http service users to a https service. A way more simple way to do
@@ -12,16 +12,27 @@ Docker repository is available at [https://hub.docker.com/r/malafoss/no80](https
 
 To run the latest container:
 
-`docker run <docker_options> -p <port>:80 docker.io/malafoss/no80 <redirect|permadirect> <url>`
+`docker run <DOCKER_OPTIONS> -p <PORT>:80 docker.io/malafoss/no80 <OPTIONS> <URL>`
 
-For example,
+Options:
+```
+  -a    Append path from the http request to the redirected URL
+  -p    Redirect permanently using 301 instead of temporarily using 302 
+```
 
-`docker run -t -i --rm -p 8080:80 docker.io/malafoss/no80 redirect https://example.com`
+Example 1:
 
-to run no80 http server in order to redirect port 8080 to https://example.com.
+`docker run -t -i --rm -p 8080:80 docker.io/malafoss/no80 https://example.com`
 
-Command _redirect_ makes temporary http redirect using [302](https://en.wikipedia.org/wiki/HTTP_302) and 
-command _permadirect_ makes permanent http redirect using [301](https://en.wikipedia.org/wiki/HTTP_301). 
+Runs no80 http server which will redirect all port 8080 requests to https://example.com.
+
+Example 2:
+
+`docker run -t -i --rm -p 8080:80 docker.io/malafoss/no80 -a https://example.com`
+
+Runs no80 http server which will redirect port 8080 requests having request path _/path_ to https://example.com/path.
+
+With _-p_ option no80 makes permanent http redirects using [301](https://en.wikipedia.org/wiki/HTTP_301) and without _-p_ option using [302](https://en.wikipedia.org/wiki/HTTP_301).
 
 ## How to build?
 
@@ -31,13 +42,9 @@ To run tests: `./test.sh`
 
 ## How to run locally built image?
 
-Running using docker (or similarly podman) to redirect temporarily (302) port 8080 to https://example.com: 
+Running using docker (or similarly podman): 
 
-```docker run -t -i --rm -p 8080:80 no80 redirect https://example.com```
-
-Running using docker (or similarly podman) to redirect permanently (301) port 8080 to https://example.com:
-
-```docker run -t -i --rm -p 8080:80 no80 permadirect https://example.com```
+```docker run -t -i --rm -p 8080:80 no80 https://example.com```
 
 ## How to run using systemd?
 
@@ -56,7 +63,7 @@ RestartSec=3
 ExecStartPre=-/usr/bin/docker stop no80
 ExecStartPre=-/usr/bin/docker rm no80
 ExecStartPre=/usr/bin/docker pull docker.io/malafoss/no80
-ExecStart=/usr/bin/docker run --rm --name no80 -p 80:80 docker.io/malafoss/no80 redirect https://example.com
+ExecStart=/usr/bin/docker run --rm --name no80 -p 80:80 docker.io/malafoss/no80 https://example.com
 ExecStop=/usr/bin/docker stop no80
 [Install]
 WantedBy=multi-user.target

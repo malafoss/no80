@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <linux/sched.h>
@@ -24,6 +25,11 @@
 
 enum command { REDIRECT = 0, REDIRECT_HOST = 1, PERMADIRECT = 2, PERMADIRECT_HOST = 3 };
 
+/* globals */
+_Atomic int threadCount = 0;
+int maxThreadCount = 0;
+time_t startTime;
+
 /* clone3 system call */
 inline pid_t sys_clone3(struct clone_args *args, int argsSize)
 {
@@ -38,7 +44,13 @@ inline pid_t fork_thread()
     ca.flags = CLONE_FILES;
     ca.exit_signal = SIGCHLD;
 
-    return sys_clone3(&ca, sizeof(ca));
+    pid_t rc = sys_clone3(&ca, sizeof(ca));
+    if (rc > 0) {
+        /* parent */
+        threadCount++;
+        if (threadCount > maxThreadCount) maxThreadCount = threadCount;
+    }
+    return rc;
 }
 
 /* signal handler SIGINTR and SIGTERM */
@@ -53,7 +65,7 @@ void thread_exited(int sig)
 {
     /* kill the zombies */
     int status;
-    while (waitpid(-1, &status, WUNTRACED | WNOHANG) > 0);
+    while (waitpid(-1, &status, WUNTRACED | WNOHANG) > 0) threadCount--;
 }
 
 /* returns listen socket fd */
@@ -269,6 +281,7 @@ noreturn void server(int port, enum command cmd, const char *url)
     server_context.tailerSize = strlen(server_context.tailer);
 
     unsigned long requests = 0;
+    startTime = time(NULL);
 
     /* prepare listen socket */
     const int fd = listen_socket(port);
@@ -312,7 +325,7 @@ noreturn void server(int port, enum command cmd, const char *url)
 #endif
 
         if ((++requests % 1000) == 0) {
-            printf("%luk redirects\n", requests / 1000);
+            printf("+%lus: %luk redirects (%d/%d threads)\n", time(NULL) - startTime, requests / 1000, threadCount, maxThreadCount);
         }
     }
 }

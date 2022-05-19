@@ -5,17 +5,18 @@ echo Building no80 image
 . ./build.sh
 
 echo Start no80 container
-container=`$builder run -d -p $testport:80 no80 https://example.com`
-echo $container
+$builder stop -i no80test
+$builder rm -i no80test
+$builder run --name no80test -d -p $testport:80 no80 https://example.com
 
 echo Test1: redirect to example.com
 curl -vL http://localhost:$testport 2>&1 | grep "Connected to example.com" && echo TEST SUCCESS || echo TEST FAILED
 
 echo Stop no80 container
-$builder stop $container
+$builder stop -i no80test
 
 echo Remove no80 container
-$builder rm $container
+$builder rm -i no80test
 
 echo Test2: no redirect to example.com
 curl -vL http://localhost:$testport 2>&1 | grep "Connected to example.com" && echo TEST FAILED || echo TEST SUCCESS

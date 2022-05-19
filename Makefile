@@ -1,5 +1,6 @@
+VERSION?=0.0.0
 CC=gcc
-CFLAGS=-std=gnu18 -Wall -flto -O3 -fdata-sections -ffunction-sections
+CFLAGS=-std=gnu18 -Wall -flto -O3 -fdata-sections -ffunction-sections -DVERSION=$(VERSION)
 LDFLAGS=-flto -s -static -Wl,--gc-sections -Wl,--strip-all -Wl,-z,norelro -Wl,--build-id=none -Wl,-O1
 
 all: no80

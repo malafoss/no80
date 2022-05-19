@@ -14,7 +14,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
-#define VERSION "0.1"
+#define STR(s) #s
 
 #define QUEUE_LENGTH 1000
 #define BUFFER_SIZE 8192
@@ -218,8 +218,10 @@ void serve(int rfd)
 
     /* send response */
     send(rfd, server_context.header, server_context.headerSize, MSG_MORE);
-    send(rfd, server_context.url,    server_context.urlSize,    MSG_MORE);
-    send(rfd, path,                  pathSize,                  MSG_MORE);
+    send(rfd, server_context.url, server_context.urlSize, MSG_MORE);
+    if (pathSize > 0) {
+        send(rfd, path, pathSize, MSG_MORE);
+    }
     send(rfd, server_context.tailer, server_context.tailerSize, 0);
 
     /* tear down */
@@ -263,7 +265,7 @@ const char *get_header(enum command cmd)
 const char *get_tailer()
 {
     return "\r\n"
-           "Server: no80/" VERSION "\r\n"
+           "Server: no80/" STR(VERSION) "\r\n"
            "Connection: close\r\n"
            "\r\n";
 }
@@ -365,7 +367,7 @@ int main(int argc, char **argv)
     const char *url = argv[argc-1];
     int port = 80;
 
-    puts("no80 v" VERSION " - The resource effective redirecting http server");
+    puts("no80 v" STR(VERSION) " - The resource effective redirecting http server");
 
     printf("Redirecting %sport %d requests to %s%s\n",
         ( option_p ? "permanently (301) " : "temporarily (302) "),

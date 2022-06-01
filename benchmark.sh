@@ -1,6 +1,6 @@
 #!/bin/bash
-requests=1000
-threads=20
+requests=100
+threads=200
 
 if [ $# -eq 0 ]; then
   echo "benchmark <portno>"

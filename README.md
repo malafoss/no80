@@ -12,7 +12,7 @@ Docker repository is available at [https://hub.docker.com/r/malafoss/no80](https
 
 To run the latest container:
 
-`docker run <DOCKER_OPTIONS> -p <PORT>:80 docker.io/malafoss/no80 <OPTIONS> <URL>`
+`<docker|podman> run <DOCKER_OPTIONS> -p <PORT>:80 docker.io/malafoss/no80 <OPTIONS> <URL>`
 
 Options:
 ```
@@ -22,17 +22,25 @@ Options:
 
 Example 1:
 
-`docker run -t -i --rm -p 8080:80 docker.io/malafoss/no80 https://example.com`
+`podman run -t -i --rm -p 8080:80 docker.io/malafoss/no80 https://example.com`
 
 Runs no80 http server which will redirect all port 8080 requests to https://example.com.
 
 Example 2:
 
-`docker run -t -i --rm -p 8080:80 docker.io/malafoss/no80 -a https://example.com`
+`podman run -t -i --rm -p 8080:80 docker.io/malafoss/no80 -a https://example.com`
 
 Runs no80 http server which will redirect port 8080 requests having request path _/path_ to https://example.com/path.
 
 With _-p_ option no80 makes permanent http redirects using [301](https://en.wikipedia.org/wiki/HTTP_301) and without _-p_ option using [302](https://en.wikipedia.org/wiki/HTTP_301).
+
+Example 3:
+
+```
+docker run --userns host --network host --privileged -t -i --rm docker.io/malafoss/no80 -a https://`hostname -f`
+```
+
+Redirect browsers accessing http port 80 to https port 443 on the current host.
 
 ## How to build?
 

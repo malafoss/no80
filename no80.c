@@ -6,6 +6,7 @@
 #include <strings.h>
 #include <time.h>
 #include <unistd.h>
+#include <sched.h>
 #include <signal.h>
 #include <linux/sched.h>
 #include <arpa/inet.h>
@@ -15,20 +16,34 @@
 #include <sys/wait.h>
 
 #define STR(s) #s
+#define STR_EVAL(e) STR(e)
+#define VERSION_STR STR_EVAL(VERSION)
 
+/* TCP connection queue length */
 #define QUEUE_LENGTH 1000
-#define BUFFER_SIZE 8192
-#define THREADING
 
+/* Read buffer size */
+#define BUFFER_SIZE 8192
+
+/* Cooldown time microseconds */
+#define COOLDOWN_TIME 100000
+
+/* Enable threading */
+#define THREADING
+#define MAX_THREADS_LIMIT 2000
+
+/* Max HTTP protocol element sizes */
 #define MAX_METHOD 10
 #define MAX_PATH 8000
 
 enum command { REDIRECT = 0, REDIRECT_HOST = 1, PERMADIRECT = 2, PERMADIRECT_HOST = 3 };
 
 /* globals */
-_Atomic int threadCount = 0;
-int maxThreadCount = 0;
+_Atomic int threads = 0;
+int maxThreads = 0;
 time_t startTime;
+_Atomic unsigned long requests = 0;
+_Atomic unsigned long successes = 0;
 
 /* clone3 system call */
 inline pid_t sys_clone3(struct clone_args *args, int argsSize)
@@ -43,20 +58,12 @@ inline pid_t fork_thread()
     bzero(&ca, sizeof(ca));
     ca.flags = CLONE_FILES;
     ca.exit_signal = SIGCHLD;
-
-    pid_t rc = sys_clone3(&ca, sizeof(ca));
-    if (rc > 0) {
-        /* parent */
-        threadCount++;
-        if (threadCount > maxThreadCount) maxThreadCount = threadCount;
-    }
-    return rc;
+    return sys_clone3(&ca, sizeof(ca));
 }
 
 /* signal handler SIGINTR and SIGTERM */
 noreturn void interrupted(int sig)
 {
-    puts("interrupted - exiting.");
     _exit(0); /* handler safe exit closes open sockets */
 }
 
@@ -64,8 +71,11 @@ noreturn void interrupted(int sig)
 void thread_exited(int sig)
 {
     /* kill the zombies */
-    int status;
-    while (waitpid(-1, &status, WUNTRACED | WNOHANG) > 0) threadCount--;
+    int status = 0;
+    while (waitpid(-1, &status, WUNTRACED | WNOHANG) > 0) {
+        --threads;
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) ++successes;
+    }
 }
 
 /* returns listen socket fd */
@@ -204,7 +214,7 @@ int receive_path(int rfd, char **path, char *buffer, int bufferSize)
 }
 
 /* serve the incoming client request */
-void serve(int rfd)
+int serve(int rfd)
 {
     char buffer[BUFFER_SIZE];
 
@@ -213,7 +223,7 @@ void serve(int rfd)
     int pathSize = receive_path(rfd, &path, buffer, sizeof(buffer));
     if (pathSize < 0) {
         close(rfd);
-        return;
+        return -1;
     }
 
     /* send response */
@@ -227,24 +237,32 @@ void serve(int rfd)
     /* tear down */
     shutdown(rfd, SHUT_RDWR);
     close(rfd);
-    return;
+    return 0;
 }
 
 /* serve the incoming client request using a new thread */
 void serve_thread(int rfd)
 {
+    if (threads >= MAX_THREADS_LIMIT) {
+        close(rfd);
+        /* thread limit reached */
+        sched_yield(); /* let ongoing threads to finish */
+        return;
+    }
     pid_t pid = fork_thread();
     if (pid < 0) {
+        // error
         perror("clone3");
         close(rfd);
         return;
     }
     if (pid == 0) {
         // child
-        serve(rfd);
-        exit(0);
+        exit(serve(rfd));
     }
     // parent
+    int tc = ++threads;
+    if (tc > maxThreads) maxThreads = tc;
     return;
 }
 
@@ -265,9 +283,19 @@ const char *get_header(enum command cmd)
 const char *get_tailer()
 {
     return "\r\n"
-           "Server: no80/" STR(VERSION) "\r\n"
+           "Server: no80/" VERSION_STR "\r\n"
            "Connection: close\r\n"
            "\r\n";
+}
+
+void printStats()
+{
+    printf("+%lus: %luk requests (%lu failures) (%d/%d threads)\n",
+        time(NULL) - startTime,
+        requests / 1000,
+        requests - successes - threads,
+        threads,
+        maxThreads);
 }
 
 /* http server */
@@ -282,7 +310,6 @@ noreturn void server(int port, enum command cmd, const char *url)
     server_context.tailer = get_tailer();
     server_context.tailerSize = strlen(server_context.tailer);
 
-    unsigned long requests = 0;
     startTime = time(NULL);
 
     /* prepare listen socket */
@@ -292,6 +319,7 @@ noreturn void server(int port, enum command cmd, const char *url)
     while (1) {
         /* accept connection */
         const int rfd = accept(fd, NULL, NULL);
+        ++requests;
         if (rfd == -1) {
             /* retry accept for these errnos */
             switch (errno) {
@@ -310,10 +338,8 @@ noreturn void server(int port, enum command cmd, const char *url)
             case EMFILE:
             case ENFILE:
                 /* out of file descriptors */
-                /* this limits how many connections can be processed simultaneously */
                 /* adjust ulimit accordingly */
-                puts("slowdown");
-                usleep(100000); /* waiting 100ms for ongoing threads to finish */
+                sched_yield(); /* let ongoing threads to finish */
                 continue;
             }
             perror("accept");
@@ -323,12 +349,10 @@ noreturn void server(int port, enum command cmd, const char *url)
 #ifdef THREADING
         serve_thread(rfd);
 #else
-        serve(rfd);
+        if (serve(rfd) == 0) ++successes;
 #endif
 
-        if ((++requests % 1000) == 0) {
-            printf("+%lus: %luk redirects (%d/%d threads)\n", time(NULL) - startTime, requests / 1000, threadCount, maxThreadCount);
-        }
+        if ((requests % 1000) == 0) printStats();
     }
 }
 
@@ -367,10 +391,10 @@ int main(int argc, char **argv)
     const char *url = argv[argc-1];
     int port = 80;
 
-    puts("no80 v" STR(VERSION) " - The resource effective redirecting http server");
+    puts("no80 v" VERSION_STR " - The resource effective redirecting http server");
 
-    printf("Redirecting %sport %d requests to %s%s\n",
-        ( option_p ? "permanently (301) " : "temporarily (302) "),
+    printf("Redirecting %s port %d requests to %s%s\n",
+        ( option_p ? "permanently (301)" : "temporarily (302)"),
         port,
         url,
         ( option_a ? "</path>" : ""));

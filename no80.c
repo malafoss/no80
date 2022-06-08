@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <string.h>
 #include <strings.h>
@@ -25,9 +26,6 @@
 /* Read buffer size */
 #define BUFFER_SIZE 8192
 
-/* Cooldown time microseconds */
-#define COOLDOWN_TIME 100000
-
 /* Enable threading */
 #define THREADING
 #define MAX_THREADS_LIMIT 2000
@@ -36,9 +34,10 @@
 #define MAX_METHOD 10
 #define MAX_PATH 8000
 
+/* redirecting command mode */
 enum command { REDIRECT = 0, REDIRECT_HOST = 1, PERMADIRECT = 2, PERMADIRECT_HOST = 3 };
 
-/* globals */
+/* globals for statistics */
 _Atomic int threads = 0;
 int maxThreads = 0;
 time_t startTime;
@@ -356,6 +355,19 @@ noreturn void server(int port, enum command cmd, const char *url)
     }
 }
 
+void printHelp()
+{
+    puts("Usage: no80 [OPTION]... URL\n"
+         "\n"
+         "The resource effective redirecting http server\n"
+         "\n"
+         "Options:\n"
+         "  -a    Append path from the http request to the redirected URL\n"
+         "  -h    Print this help text and exit\n"
+         "  -p N  Use specified port number N (default is port 80)\n"
+         "  -P    Redirect permanently using 301 instead of temporarily using 302");
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGINT, interrupted);
@@ -363,39 +375,53 @@ int main(int argc, char **argv)
     signal(SIGCHLD, thread_exited);
 
     if (argc < 2) {
-        puts("Usage: no80 [OPTION]... URL");
-        puts("");
-        puts("A redirecting http server");
-        puts("");
-        puts("Options:");
-        puts("  -a    Append path from the http request to the redirected URL");
-        puts("  -p    Redirect permanently using 301 instead of temporarily using 302");
+        printHelp();
         return 1;
     }
 
-    int option_p = 0;
-    int option_a = 0;
+    bool option_P = 0;
+    bool option_a = 0;
+    int port = 80;
+    const char *url = NULL;
 
-    for (int i = 1; i < argc-1; i++) {
-        if (strcmp(argv[i], "-p") == 0) {
-            option_p = 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-P") == 0) {
+            option_P = 1;
         } else if (strcmp(argv[i], "-a") == 0) {
             option_a = 1;
-        } else {
+        } else if (strcmp(argv[i], "-p") == 0) {
+            if (++i < argc) {
+                port = atoi(argv[i]);
+                if (port < 1 || port > 65535) {
+                    puts("Invalid port number specified");
+                    return 1;
+                }
+            } else {
+                puts("Missing port number");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-h") == 0) {
+            printHelp();
+            return 1;
+       } else if (!url) {
+            url = argv[i];
+       } else {
             printf("Invalid parameter %s\n", argv[i]);
             return 1;
         }
     }
+    if (!url) {
+        puts("Missing URL parameter");
+        return 1;
+    }
 
-    enum command cmd = (option_p ? PERMADIRECT : REDIRECT) | (option_a ? REDIRECT_HOST : REDIRECT);
-    const char *url = argv[argc-1];
-    int port = 80;
+    enum command cmd = (option_P ? PERMADIRECT : REDIRECT) | (option_a ? REDIRECT_HOST : REDIRECT);
 
     puts("no80 v" VERSION_STR " - The resource effective redirecting http server");
 
-    printf("Redirecting %s port %d requests to %s%s\n",
-        ( option_p ? "permanently (301)" : "temporarily (302)"),
+    printf("Redirecting port %d requests %s to %s%s\n",
         port,
+        ( option_P ? "permanently (301)" : "temporarily (302)"),
         url,
         ( option_a ? "</path>" : ""));
 

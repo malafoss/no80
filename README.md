@@ -17,7 +17,9 @@ To run the latest container:
 Options:
 ```
   -a    Append path from the http request to the redirected URL
-  -p    Redirect permanently using 301 instead of temporarily using 302 
+  -h    Print this help text and exit
+  -p N  Use specified port number N (default is port 80)
+  -P    Redirect permanently using 301 instead of temporarily using 302
 ```
 
 Example 1:
@@ -32,7 +34,7 @@ Example 2:
 
 Runs no80 http server which will redirect port 8080 requests having request path _/path_ to https://example.com/path.
 
-With _-p_ option no80 makes permanent http redirects using [301](https://en.wikipedia.org/wiki/HTTP_301) and without _-p_ option using [302](https://en.wikipedia.org/wiki/HTTP_301).
+With _-P_ option, no80 will make permanent http redirects using [301](https://en.wikipedia.org/wiki/HTTP_301) and without _-P_ option using [302](https://en.wikipedia.org/wiki/HTTP_301).
 
 Example 3:
 

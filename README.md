@@ -34,7 +34,7 @@ Example 2:
 
 Runs no80 http server which will redirect port 8080 requests having request path _/path_ to https://example.com/path.
 
-With _-P_ option, no80 will make permanent http redirects using [301](https://en.wikipedia.org/wiki/HTTP_301) and without _-P_ option using [302](https://en.wikipedia.org/wiki/HTTP_301).
+With _-P_ option, no80 will make permanent http redirects using [301](https://en.wikipedia.org/wiki/HTTP_301) and without _-P_ option using [302](https://en.wikipedia.org/wiki/HTTP_302).
 
 Example 3:
 

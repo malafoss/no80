@@ -1,6 +1,6 @@
 FROM docker.io/gcc:12 AS compile
 WORKDIR /no80-src
-COPY Makefile no80.c VERSION .
+COPY Makefile no80.c VERSION ./
 RUN make
 
 FROM scratch AS build

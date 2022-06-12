@@ -77,20 +77,20 @@ int listen_socket(int port)
         if (setsockopt(fd, SOL_TCP, TCP_NODELAY, &option, sizeof(option))) {
             perror("setsockopt");
             exit(2);
-	    }
+        }
     }
 
     /* bind the port */
     {
         struct sockaddr_in address;
-	    bzero(&address, sizeof(address));
-	    address.sin_family = AF_INET;
-	    address.sin_addr.s_addr = INADDR_ANY;
-	    address.sin_port = htons(port);
-	    if (bind(fd, (struct sockaddr*)&address, sizeof(address)) == -1) {
+        bzero(&address, sizeof(address));
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(port);
+        if (bind(fd, (struct sockaddr*)&address, sizeof(address)) == -1) {
             perror("bind");
-	        exit(2);
-	    }
+            exit(2);
+        }
     }
 
     /* list the port */

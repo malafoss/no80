@@ -7,74 +7,49 @@
 #include <strings.h>
 #include <time.h>
 #include <unistd.h>
-#include <sched.h>
 #include <signal.h>
-#include <linux/sched.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <stdnoreturn.h>
-#include <sys/syscall.h>
-#include <sys/wait.h>
+#include <sys/epoll.h>
 
 #define STR(s) #s
 #define STR_EVAL(e) STR(e)
 #define VERSION_STR STR_EVAL(VERSION)
 
 /* TCP connection queue length */
-#define QUEUE_LENGTH 1000
+#define QUEUE_LENGTH 256
 
 /* Read buffer size */
 #define BUFFER_SIZE 8192
-
-/* Enable threading */
-#define THREADING
-#define MAX_THREADS_LIMIT 2000
 
 /* Max HTTP protocol element sizes */
 #define MAX_METHOD 10
 #define MAX_PATH 8000
 
+/* Epoll parameters */
+#define MAX_EPOLL_CREATES 100
+#define MAX_EPOLL_EVENTS 100
+#define EPOLL_TIMEOUT_MS 60*1000
+
 /* redirecting command mode */
 enum command { REDIRECT = 0, REDIRECT_HOST = 1, PERMADIRECT = 2, PERMADIRECT_HOST = 3 };
 
 /* globals for statistics */
-_Atomic int threads = 0;
-int maxThreads = 0;
+bool noStatistics = 0;
 time_t startTime;
-_Atomic unsigned long requests = 0;
-_Atomic unsigned long successes = 0;
-
-/* clone3 system call */
-inline pid_t sys_clone3(struct clone_args *args, int argsSize)
-{
-	return syscall(__NR_clone3, args, argsSize);
-}
-
-/* fork thread using fork semantics */
-inline pid_t fork_thread()
-{
-    struct clone_args ca;
-    bzero(&ca, sizeof(ca));
-    ca.flags = CLONE_FILES;
-    ca.exit_signal = SIGCHLD;
-    return sys_clone3(&ca, sizeof(ca));
-}
+unsigned long requests = 0;
+unsigned long successes = 0;
+unsigned long completed = 0;
+int connections = -1; /* ignore efd */
+int maxConns = 0;
+int maxEvents = 0;
 
 /* signal handler SIGINTR and SIGTERM */
 noreturn void interrupted(int sig)
 {
     _exit(0); /* handler safe exit closes open sockets */
-}
-
-/* signal handler SIGCHLD */
-void thread_exited(int sig)
-{
-    /* kill the zombies */
-    int status = 0;
-    while (waitpid(-1, &status, WUNTRACED | WNOHANG) > 0) {
-        --threads;
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) ++successes;
-    }
 }
 
 /* returns listen socket fd */
@@ -91,18 +66,6 @@ int listen_socket(int port)
     {
         int option = 1; /* enable */
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option))) {
-            perror("setsockopt");
-            exit(2);
-        }
-    }
-
-    /* enable lingering close */
-    {
-        struct linger option;
-	    bzero(&option, sizeof(option));
-        option.l_onoff = 1;
-	    option.l_linger = 1; /* seconds */
-        if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &option, sizeof(option))) {
             perror("setsockopt");
             exit(2);
         }
@@ -150,119 +113,87 @@ static struct server_params {
     int tailerSize;
 } server_context;
 
-/* return size and update new received path to path pointer */
-int receive_path(int rfd, char **path, char *buffer, int bufferSize)
-{
-    if (server_context.cmd == REDIRECT_HOST || server_context.cmd == PERMADIRECT_HOST) {
-        char *recvEnd = buffer;
-        char *ptr = buffer;
-        char *pathBegin = NULL;
-        char *pathEnd = NULL;
+struct connect_params {
+    int fd;
+    struct epoll_event ee;
+    char *recvPtr;
+    time_t connectedTime;
+    const char *methodBegin;
+    const char *methodEnd;
+    const char *pathBegin;
+    const char *pathEnd;
+    char buffer[BUFFER_SIZE];
+};
 
-        while (ptr < buffer + bufferSize) {
-            if (ptr == recvEnd) {
+/* read http request - 0 = OK, 1 = Call again, -1 = Error */
+int read_request(struct connect_params *cp)
+{
+    int bufferSize = sizeof(cp->buffer);
+
+    if (server_context.cmd == REDIRECT_HOST || server_context.cmd == PERMADIRECT_HOST) {
+        /* read request beginning in form: Method SP Request-URI SP */
+        /* allowed Request-URI is in form: '/' PATH */
+
+        if (!cp->recvPtr) cp->recvPtr = cp->buffer;
+        if (!cp->methodBegin) cp->methodBegin = cp->buffer;
+
+        char *ptr = cp->recvPtr;
+        while (ptr < cp->buffer + bufferSize) {
+            if (ptr == cp->recvPtr) {
                 /* recv more data */
-                int bytes = recv(rfd, recvEnd, bufferSize - (recvEnd - buffer), 0);
+                int bytes = recv(cp->fd, cp->recvPtr, bufferSize - (cp->recvPtr - cp->buffer), MSG_DONTWAIT);
                 if (bytes == -1) {
+                    if (errno == EAGAIN) return 1; // recv more later
                     perror("recv");
                     return -1;
                 }
-                if (bytes == 0) break;
-                recvEnd += bytes;
+                if (bytes == 0) return -1; // needed bytes, so its error
+                cp->recvPtr += bytes;
             }
 
             char c = *ptr++;
 
-            /* disallowed characters */
+            /* stop if disallowed characters */
             if (c == '\r' || c == '\n') break;
 
-            if (!pathBegin) {
-                /* in METHOD */
-                if (ptr - buffer > MAX_METHOD) break;
+            if (!cp->methodEnd) {
+                /* in Method */
+                if (ptr - cp->buffer > MAX_METHOD) break;
                 if (c == ' ') {
-                    pathBegin = ptr;
+                    cp->methodEnd = ptr-1;
+                    cp->pathBegin = ptr;
                 }
             } else {
                 /* in Request-URI */
-                if (ptr - pathBegin > MAX_PATH) break;
-                if (c == ' ') {
-                    pathEnd = ptr-1;
+                if (ptr - cp->pathBegin > MAX_PATH || c == ' ') {
+                    cp->pathEnd = ptr-1;
                     break;
                 }
             }
         }
 
         /* ignore rest of the data */
-        recv(rfd, buffer, bufferSize, MSG_DONTWAIT|MSG_TRUNC);
+        recv(cp->fd, cp->buffer, bufferSize, MSG_DONTWAIT|MSG_TRUNC);
 
-        if (pathBegin && pathEnd && *pathBegin == '/') {
+        if (cp->pathBegin && cp->pathEnd && *(cp->pathBegin) == '/') {
             /* path found */
-            *path = pathBegin;
-            return pathEnd - pathBegin;
+            return 0;
         }
 
         /* no path - return empty path */
-        *path = "";
+        cp->methodEnd = cp->buffer;
+        cp->pathBegin = cp->buffer;
+        cp->pathEnd = cp->buffer;
         return 0;
     }
 
     /* ignore request for other commands */
-    recv(rfd, buffer, bufferSize, MSG_TRUNC);
-    *path = "";
+    recv(cp->fd, cp->buffer, bufferSize, MSG_DONTWAIT|MSG_TRUNC);
+    cp->methodBegin = cp->buffer;
+    cp->methodEnd = cp->buffer;
+    cp->pathBegin = cp->buffer;
+    cp->pathEnd = cp->buffer;
     return 0;
-}
-
-/* serve the incoming client request */
-int serve(int rfd)
-{
-    char buffer[BUFFER_SIZE];
-
-    /* read requested path */
-    char *path;
-    int pathSize = receive_path(rfd, &path, buffer, sizeof(buffer));
-    if (pathSize < 0) {
-        close(rfd);
-        return -1;
-    }
-
-    /* send response */
-    send(rfd, server_context.header, server_context.headerSize, MSG_MORE);
-    send(rfd, server_context.url, server_context.urlSize, MSG_MORE);
-    if (pathSize > 0) {
-        send(rfd, path, pathSize, MSG_MORE);
-    }
-    send(rfd, server_context.tailer, server_context.tailerSize, 0);
-
-    /* tear down */
-    shutdown(rfd, SHUT_RDWR);
-    close(rfd);
-    return 0;
-}
-
-/* serve the incoming client request using a new thread */
-void serve_thread(int rfd)
-{
-    if (threads >= MAX_THREADS_LIMIT) {
-        close(rfd);
-        /* thread limit reached */
-        sched_yield(); /* let ongoing threads to finish */
-        return;
-    }
-    pid_t pid = fork_thread();
-    if (pid < 0) {
-        // error
-        perror("clone3");
-        close(rfd);
-        return;
-    }
-    if (pid == 0) {
-        // child
-        exit(serve(rfd));
-    }
-    // parent
-    int tc = ++threads;
-    if (tc > maxThreads) maxThreads = tc;
-    return;
 }
 
 /* returns the first part of the response */
@@ -287,14 +218,60 @@ const char *get_tailer()
            "\r\n";
 }
 
+/* print statistics */
 void printStats()
 {
-    printf("+%lus: %luk requests (%lu failures) (%d/%d threads)\n",
-        time(NULL) - startTime,
-        requests / 1000,
-        requests - successes - threads,
-        threads,
-        maxThreads);
+    if (!noStatistics) {
+        printf("+%lus: %lu requests (%lu successes, %lu failures, %d ongoing) (%d max events, %d max conns)\n",
+            time(NULL) - startTime,
+            requests,
+            successes,
+            completed - successes,
+            connections,
+            maxEvents,
+            maxConns);
+    }
+    maxEvents = 0;
+    maxConns = 0;
+}
+
+/* allocate new connection parameters */
+struct connect_params *new_connect(int fd)
+{
+    struct connect_params *c = malloc(sizeof(struct connect_params));
+    if (!c) return NULL;
+    bzero(c, sizeof(struct connect_params));
+    c->fd = fd;
+    c->connectedTime = time(NULL);
+    ++connections;
+    if (connections > maxConns) maxConns = connections;
+    return c;
+}
+
+/* send http response */
+void send_response(struct connect_params *cp)
+{
+    /* send response */
+    send(cp->fd, server_context.header, server_context.headerSize, MSG_DONTWAIT|MSG_MORE);
+    send(cp->fd, server_context.url, server_context.urlSize, MSG_DONTWAIT|MSG_MORE);
+    if (cp->pathEnd - cp->pathBegin > 0) {
+        send(cp->fd, cp->pathBegin, cp->pathEnd - cp->pathBegin, MSG_DONTWAIT|MSG_MORE);
+    }
+    send(cp->fd, server_context.tailer, server_context.tailerSize, MSG_DONTWAIT);
+
+    /* tear down */
+    shutdown(cp->fd, SHUT_RDWR);
+}
+
+/* free allocated connection parameters */
+void free_connect(struct connect_params *cp)
+{
+    if (cp) {
+        close(cp->fd);
+        free(cp);
+    }
+    --connections;
+    ++completed;
 }
 
 /* http server */
@@ -314,47 +291,126 @@ noreturn void server(int port, enum command cmd, const char *url)
     /* prepare listen socket */
     const int fd = listen_socket(port);
 
-    /* serve incoming connections */
+    const int efd = epoll_create(MAX_EPOLL_CREATES);
+    if (efd == -1) {
+        perror("epoll_create");
+        exit(2);
+    }
+
+    struct epoll_event ee;
+    ee.events = EPOLLIN;
+    ee.data.ptr = new_connect(fd);
+    if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ee) < 0) {
+        perror("epoll_ctl");
+        exit(2);
+    }
+
+    struct epoll_event ees[MAX_EPOLL_EVENTS];
+
+    /* serve incoming events */
     while (1) {
-        /* accept connection */
-        const int rfd = accept(fd, NULL, NULL);
-        ++requests;
-        if (rfd == -1) {
-            /* retry accept for these errnos */
-            switch (errno) {
-            case EAGAIN:
-            case EINPROGRESS:
-            case ENETDOWN:
-            case EPROTO:
-            case ENOPROTOOPT:
-            case EHOSTDOWN:
-            case ENONET:
-            case EHOSTUNREACH:
-            case EOPNOTSUPP:
-            case ENETUNREACH:
-	            puts("again");
-                continue;
-            case EMFILE:
-            case ENFILE:
-                /* out of file descriptors */
-                /* adjust ulimit accordingly */
-                sched_yield(); /* let ongoing threads to finish */
-                continue;
-            }
-            perror("accept");
+        int count = epoll_wait(efd, ees, sizeof(ees)/sizeof(ees[0]), EPOLL_TIMEOUT_MS);
+        if (count == -1) {
+            perror("epoll_wait");
             exit(2);
         }
+        if (count == 0) {
+            /* timeout */
+            if (maxEvents > 0) {
+                printStats();
+            }
+            continue;
+        }
+        if (count > maxEvents) maxEvents = count;
 
-#ifdef THREADING
-        serve_thread(rfd);
-#else
-        if (serve(rfd) == 0) ++successes;
-#endif
+        for (int i = 0; i < count; i++) {
+            struct connect_params *cp = (struct connect_params *)ees[i].data.ptr;
 
-        if ((requests % 1000) == 0) printStats();
+            if (cp->fd == fd) {
+                /* accept new connection event */
+                const int rfd = accept(fd, NULL, NULL);
+                if (rfd == -1) {
+                    /* retry accept for these errnos */
+                    switch (errno) {
+                    case EAGAIN:
+                    case EINPROGRESS:
+                    case ENETDOWN:
+                    case EPROTO:
+                    case ENOPROTOOPT:
+                    case EHOSTDOWN:
+                    case ENONET:
+                    case EHOSTUNREACH:
+                    case EOPNOTSUPP:
+                    case ENETUNREACH:
+                        continue;
+                    case EMFILE:
+                    case ENFILE:
+                        /* out of file descriptors */
+                        /* adjust ulimit accordingly */
+                        perror("accept");
+                        continue;
+                    default:
+                        perror("accept");
+                        exit(2);
+                    }
+                }
+
+                /* nonblocking socket */
+                fcntl(rfd, F_SETFL, fcntl(rfd, F_GETFL) | O_NONBLOCK);
+
+                /* new connection -> EPOLLIN event */
+                struct connect_params *cp = new_connect(rfd);
+                cp->ee.events = EPOLLIN;
+                cp->ee.data.ptr = cp;
+                if (epoll_ctl(efd, EPOLL_CTL_ADD, rfd, &(cp->ee)) < 0) {
+                    perror("epoll_ctl add");
+                    free_connect(cp);
+                    continue;
+                }
+                ++requests;
+                if ((requests % 1000) == 0) printStats();
+                continue;
+            }
+
+            /* handle connection events */
+            if (ees[i].events & EPOLLIN) {
+                /* read request */
+                int rc = read_request(cp);
+                if (rc < 0) {
+                    /* failure -> delete event */
+                    if (epoll_ctl(efd, EPOLL_CTL_DEL, cp->fd, NULL) < 0) {
+                        perror("epoll_ctl del");
+                    }
+                    free_connect(cp);
+                    continue;
+                }
+                if (rc > 0) {
+                    /* recv more when available */
+                    continue;
+                }
+                /* success -> EPOLLOUT event */
+                cp->ee.events = EPOLLOUT;
+                if (epoll_ctl(efd, EPOLL_CTL_MOD, cp->fd, &(cp->ee)) < 0) {
+                    perror("epoll_ctl out");
+                }
+                continue;
+            }
+            if (ees[i].events & EPOLLOUT) {
+                /* send response -> delete event */
+                send_response(cp);
+                if (epoll_ctl(efd, EPOLL_CTL_DEL, cp->fd, NULL) < 0) {
+                    perror("epoll_ctl del");
+                }
+                ++successes;
+                free_connect(cp);
+                continue;
+            }
+            /* unknown event */
+        }
     }
 }
 
+/* print help text */
 void printHelp()
 {
     puts("Usage: no80 [OPTION]... URL\n"
@@ -365,14 +421,14 @@ void printHelp()
          "  -a    Append path from the http request to the redirected URL\n"
          "  -h    Print this help text and exit\n"
          "  -p N  Use specified port number N (default is port 80)\n"
-         "  -P    Redirect permanently using 301 instead of temporarily using 302");
+         "  -P    Redirect permanently using 301 instead of temporarily using 302\n"
+         "  -q    Suppress statistics");
 }
 
 int main(int argc, char **argv)
 {
     signal(SIGINT, interrupted);
     signal(SIGTERM, interrupted);
-    signal(SIGCHLD, thread_exited);
 
     if (argc < 2) {
         printHelp();
@@ -389,6 +445,8 @@ int main(int argc, char **argv)
             option_P = 1;
         } else if (strcmp(argv[i], "-a") == 0) {
             option_a = 1;
+        } else if (strcmp(argv[i], "-q") == 0) {
+            noStatistics = 1;
         } else if (strcmp(argv[i], "-p") == 0) {
             if (++i < argc) {
                 port = atoi(argv[i]);

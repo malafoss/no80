@@ -9,17 +9,20 @@
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <assert.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <stdnoreturn.h>
 #include <sys/epoll.h>
 
+static_assert(EAGAIN == EWOULDBLOCK);
+
 #define STR(s) #s
 #define STR_EVAL(e) STR(e)
 #define VERSION_STR STR_EVAL(VERSION)
 
-/* TCP connection queue length */
-#define QUEUE_LENGTH 256
+/* TCP parameters */
+#define QUEUE_LENGTH 1000
 
 /* Read buffer size */
 #define BUFFER_SIZE 8192
@@ -27,10 +30,11 @@
 /* Max HTTP protocol element sizes */
 #define MAX_METHOD 10
 #define MAX_PATH 8000
+static_assert(BUFFER_SIZE > MAX_METHOD + MAX_PATH + 128);
 
 /* Epoll parameters */
-#define MAX_EPOLL_CREATES 100
-#define MAX_EPOLL_EVENTS 100
+#define MAX_EPOLL_CREATES 256
+#define MAX_EPOLL_EVENTS 256
 #define EPOLL_TIMEOUT_MS 60*1000
 
 /* redirecting command mode */
@@ -116,13 +120,20 @@ static struct server_params {
 struct connect_params {
     int fd;
     struct epoll_event ee;
+
+    /* read params */
     char *recvPtr;
-    time_t connectedTime;
     const char *methodBegin;
     const char *methodEnd;
     const char *pathBegin;
     const char *pathEnd;
     char buffer[BUFFER_SIZE];
+
+    /* send params */
+    int headerSent;
+    int urlSent;
+    int pathSent;
+    int tailerSent;
 };
 
 /* read http request - 0 = OK, 1 = Call again, -1 = Error */
@@ -242,25 +253,53 @@ struct connect_params *new_connect(int fd)
     if (!c) return NULL;
     bzero(c, sizeof(struct connect_params));
     c->fd = fd;
-    c->connectedTime = time(NULL);
     ++connections;
     if (connections > maxConns) maxConns = connections;
     return c;
 }
 
-/* send http response */
-void send_response(struct connect_params *cp)
+int send_part(int fd, const char *msg, int msgsize, int *sent, bool last)
 {
-    /* send response */
-    send(cp->fd, server_context.header, server_context.headerSize, MSG_DONTWAIT|MSG_MORE);
-    send(cp->fd, server_context.url, server_context.urlSize, MSG_DONTWAIT|MSG_MORE);
-    if (cp->pathEnd - cp->pathBegin > 0) {
-        send(cp->fd, cp->pathBegin, cp->pathEnd - cp->pathBegin, MSG_DONTWAIT|MSG_MORE);
+    int rc = send(fd, msg + *sent, msgsize - *sent, MSG_DONTWAIT | (last ? 0 : MSG_MORE));
+    if (rc < 0) {
+        if (errno == EAGAIN) return 1;
+        perror("send");
+        return -1;
     }
-    send(cp->fd, server_context.tailer, server_context.tailerSize, MSG_DONTWAIT);
+    *sent += rc;
+    return 0;
+}
+
+/* send http response - 0 = OK, 1 = Call again, -1 = Error */
+int send_response(struct connect_params *cp)
+{
+    int rc;
+
+    /* send response */
+    if (server_context.headerSize > cp->headerSent) {
+        rc = send_part(cp->fd, server_context.header, server_context.headerSize, &(cp->headerSent), 0);
+        if (rc != 0) return rc;
+    }
+
+    if (server_context.urlSize > cp->urlSent) {
+        rc = send_part(cp->fd, server_context.url, server_context.urlSize, &(cp->urlSent), 0);
+        if (rc != 0) return rc;
+    }
+
+    int pathSize = cp->pathEnd - cp->pathBegin;
+    if (pathSize > cp->pathSent) {
+        rc = send_part(cp->fd, cp->pathBegin, pathSize, &(cp->pathSent), 0);
+        if (rc != 0) return rc;
+    }
+
+    if (server_context.tailerSize > cp->tailerSent) {
+        rc = send_part(cp->fd, server_context.tailer, server_context.tailerSize, &(cp->tailerSent), 1);
+        if (rc != 0) return rc;
+    }
 
     /* tear down */
     shutdown(cp->fd, SHUT_RDWR);
+    return 0;
 }
 
 /* free allocated connection parameters */
@@ -397,11 +436,15 @@ noreturn void server(int port, enum command cmd, const char *url)
             }
             if (ees[i].events & EPOLLOUT) {
                 /* send response -> delete event */
-                send_response(cp);
+                int rc = send_response(cp);
+                if (rc > 0) {
+                    /* send more again later */
+                    continue;
+                }
+                if (rc == 0) ++successes;
                 if (epoll_ctl(efd, EPOLL_CTL_DEL, cp->fd, NULL) < 0) {
                     perror("epoll_ctl del");
                 }
-                ++successes;
                 free_connect(cp);
                 continue;
             }

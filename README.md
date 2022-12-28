@@ -3,7 +3,7 @@
 no80 - The resource effective redirecting http server
 
 No80 is a minimal dockerized http server that only makes redirects temporarily (302) or permanently (301)
-to a given URL. Often used to redirect http service users to a https service. A way more simple way to do
+to given URLs. Often used to redirect http service users to a https service. A way more simple way to do
 http redirects than, for example, nginx. The docker image size is under one megabyte.
 
 ## Using container image
@@ -18,12 +18,17 @@ To run the latest container:
 
 Options:
 ```
-  -a    Append path from the http request to the redirected URL
-  -h    Print this help text and exit
-  -p N  Use specified port number N (default is port 80)
-  -P    Redirect permanently using 301 instead of temporarily using 302
-  -q    Suppress statistics
+  -a           Append path from the http request to the redirected URL
+  -h           Print this help text and exit
+  -m PATH URL  Redirect path matching with PATH to URL
+  -s PATH URL  Redirect path starting with PATH to URL
+  -r PATH URL  Redirect path starting with PATH to URL appended with the rest of the path
+  -p N         Use specified port number N (default is port 80)
+  -P           Redirect permanently using 301 instead of temporarily using 302
+  -q           Suppress statistics
 ```
+
+With _-P_ option, no80 will make permanent http redirects using [301](https://en.wikipedia.org/wiki/HTTP_301) and without _-P_ option using [302](https://en.wikipedia.org/wiki/HTTP_302).
 
 Example 1:
 
@@ -41,8 +46,6 @@ podman run -t -i --rm -p 8080:80 docker.io/malafoss/no80 -a https://example.com
 
 Runs no80 http server which will redirect port 8080 requests having request path _/path_ to https://example.com/path.
 
-With _-P_ option, no80 will make permanent http redirects using [301](https://en.wikipedia.org/wiki/HTTP_301) and without _-P_ option using [302](https://en.wikipedia.org/wiki/HTTP_302).
-
 Example 3:
 
 ```
@@ -54,6 +57,27 @@ docker run -t -i --rm -p 80:80 docker.io/malafoss/no80 -a https://`hostname -f`
 ```
 
 Redirect browsers accessing http port 80 to https port 443 on the current host.
+
+Example 4:
+
+```
+podman run -t -i --rm -p 8080:80 docker.io/malafoss/no80 -m /match https://siteA/pathA https://siteB/pathB
+```
+
+Redirect browsers accessing http port 8080 to https://siteA/pathA if request path matches with _/match_. Otherwise browsers are redirected to https://siteB/pathB.
+
+Example 5:
+
+```
+podman run -t -i --rm -p 8080:80 docker.io/malafoss/no80 -m /match https://siteA/pathA -s /starting https://siteB/pathB -r /redirect https://siteC/pathC https://siteD/pathD
+```
+
+Redirect exact path _/match_ to https://siteA/pathA.
+Redirect paths starting with _/starting_ such as _/starting/mypath_ to https://siteB/pathB.
+Redirect paths starting with _/redirect_ such as _/redirect/mypath_ to https://siteC/pathC/mypath.
+Otherwise redirect by default to https://siteD/pathD.
+
+Note that multiple _-m_, _-s_ and _-r_ options are allowed and are processed in the given order.
 
 ## How to build?
 

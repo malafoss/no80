@@ -38,7 +38,10 @@ static_assert(BUFFER_SIZE > MAX_METHOD + MAX_PATH + 128);
 #define EPOLL_TIMEOUT_MS 60*1000
 
 /* redirecting command mode */
-enum command { REDIRECT = 0, REDIRECT_HOST = 1, PERMADIRECT = 2, PERMADIRECT_HOST = 3 };
+enum command { REDIRECT = 0, PERMADIRECT = 1 };
+
+/* maximum number of matched path redirections */
+#define MAX_MATCHES 256
 
 /* globals for statistics */
 bool noStatistics = 0;
@@ -106,17 +109,33 @@ int listen_socket(int port)
     return fd;
 }
 
+/* match path and target url pairs */
+static struct match_params {
+    const char *path; /* matched path */
+    int pathSize;
+    const char *url; /* target url */
+    int urlSize;
+    bool append; /* append path to url */
+    bool begin; /* match the beginning of the path only */
+} pathMatch[MAX_MATCHES];
+
 /* shared read-only server context for all threads */
 static struct server_params {
-    enum command cmd;
-    const char *header;
-    int headerSize;
-    const char *url;
-    int urlSize;
-    const char *tailer;
-    int tailerSize;
-} server_context;
+    enum command cmd; /* server command */
+    bool append; /* append path to url */
+    struct match_params *pathMatch; /* path matches array */
+    int matches; /* number of path matches in the array */
 
+    /* default output parameters */
+    const char *header; /* header to output */
+    int headerSize;
+    const char *url; /* url to redirect to */
+    int urlSize;
+    const char *tailer; /* tailer to output */
+    int tailerSize;
+} serverContext;
+
+/* connection related parameters */
 struct connect_params {
     int fd;
     struct epoll_event ee;
@@ -129,6 +148,10 @@ struct connect_params {
     const char *pathEnd;
     char buffer[BUFFER_SIZE];
 
+    /* target url */
+    const char *url;
+    int urlSize;
+
     /* send params */
     int headerSent;
     int urlSent;
@@ -136,72 +159,115 @@ struct connect_params {
     int tailerSent;
 };
 
+/* try finding matching path, NULL if no match */
+struct match_params *match_path(const char *p, int size)
+{
+    if (size <= 0) return NULL;
+    struct match_params *match = &(serverContext.pathMatch[0]);
+    int matches = serverContext.matches;
+    while (matches--) {
+        int msize = match->pathSize;
+        /* if match begin then match the beginning of the path only */
+        if (msize == size || (match->begin && msize < size))
+            if (memcmp(p, match->path, msize) == 0)
+                return match;
+        match++;
+    }
+    return NULL;
+}
+
 /* read http request - 0 = OK, 1 = Call again, -1 = Error */
 int read_request(struct connect_params *cp)
 {
     int bufferSize = sizeof(cp->buffer);
 
-    if (server_context.cmd == REDIRECT_HOST || server_context.cmd == PERMADIRECT_HOST) {
-        /* read request beginning in form: Method SP Request-URI SP */
-        /* allowed Request-URI is in form: '/' PATH */
+    /* read request beginning in form: Method SP Request-URI SP */
+    /* allowed Request-URI is in form: '/' PATH */
 
-        if (!cp->recvPtr) cp->recvPtr = cp->buffer;
-        if (!cp->methodBegin) cp->methodBegin = cp->buffer;
+    if (!cp->recvPtr) cp->recvPtr = cp->buffer;
+    if (!cp->methodBegin) cp->methodBegin = cp->buffer;
 
-        char *ptr = cp->recvPtr;
-        while (ptr < cp->buffer + bufferSize) {
-            if (ptr == cp->recvPtr) {
-                /* recv more data */
-                int bytes = recv(cp->fd, cp->recvPtr, bufferSize - (cp->recvPtr - cp->buffer), MSG_DONTWAIT);
-                if (bytes == -1) {
-                    if (errno == EAGAIN) return 1; // recv more later
-                    perror("recv");
-                    return -1;
-                }
-                if (bytes == 0) return -1; // needed bytes, so its error
-                cp->recvPtr += bytes;
+    char *ptr = cp->recvPtr;
+    while (ptr < cp->buffer + bufferSize) {
+        if (ptr == cp->recvPtr) {
+            /* recv more data */
+            int bytes = recv(cp->fd, cp->recvPtr, bufferSize - (cp->recvPtr - cp->buffer), MSG_DONTWAIT);
+            if (bytes == -1) {
+                if (errno == EAGAIN) return 1; // recv more later
+                perror("recv");
+                return -1;
             }
-
-            char c = *ptr++;
-
-            /* stop if disallowed characters */
-            if (c == '\r' || c == '\n') break;
-
-            if (!cp->methodEnd) {
-                /* in Method */
-                if (ptr - cp->buffer > MAX_METHOD) break;
-                if (c == ' ') {
-                    cp->methodEnd = ptr-1;
-                    cp->pathBegin = ptr;
-                }
-            } else {
-                /* in Request-URI */
-                if (ptr - cp->pathBegin > MAX_PATH || c == ' ') {
-                    cp->pathEnd = ptr-1;
-                    break;
-                }
-            }
+            if (bytes == 0) return -1; // needed bytes, so its error
+            cp->recvPtr += bytes;
         }
 
-        /* ignore rest of the data */
-        recv(cp->fd, cp->buffer, bufferSize, MSG_DONTWAIT|MSG_TRUNC);
+        char c = *ptr++;
 
-        if (cp->pathBegin && cp->pathEnd && *(cp->pathBegin) == '/') {
-            /* path found */
+        /* stop if disallowed characters */
+        if (c == '\r' || c == '\n') break;
+
+        if (!cp->methodEnd) {
+            /* in Method */
+            if (ptr - cp->buffer > MAX_METHOD) break;
+            if (c == ' ') {
+                cp->methodEnd = ptr-1;
+                cp->pathBegin = ptr;
+            }
+        } else {
+            /* in Request-URI */
+            if (ptr - cp->pathBegin > MAX_PATH || c == ' ') {
+                cp->pathEnd = ptr-1;
+                break;
+            }
+        }
+    }
+
+    /* ignore rest of the data */
+    recv(cp->fd, cp->buffer, bufferSize, MSG_DONTWAIT|MSG_TRUNC);
+
+    if (cp->pathBegin && cp->pathEnd && *(cp->pathBegin) == '/') {
+        /* path found */
+
+        /* try matching path */
+        struct match_params *match = match_path(cp->pathBegin, cp->pathEnd - cp->pathBegin);
+        if (match) {
+            /* match found, redirect to matching url */
+            cp->url = match->url;
+            cp->urlSize = match->urlSize;
+
+            if (match->append) {
+                /* match with append */
+
+                /* append non-matching part of the path to the matching url */
+                cp->pathBegin += match->pathSize;
+                if (cp->pathBegin > cp->pathEnd) cp->pathBegin = cp->pathEnd;
+                return 0;
+            }
+
+            /* match without append */
+            cp->pathBegin = cp->buffer;
+            cp->pathEnd = cp->buffer;
             return 0;
         }
 
-        /* no path - return empty path */
-        cp->methodEnd = cp->buffer;
+        /* default match, redirect to default url */
+        cp->url = serverContext.url;
+        cp->urlSize = serverContext.urlSize;
+
+        if (serverContext.append) {
+            /* default match with append */
+            return 0;
+        }
+
+        /* default match without append */
         cp->pathBegin = cp->buffer;
         cp->pathEnd = cp->buffer;
         return 0;
     }
 
-    /* ignore request for other commands */
-    recv(cp->fd, cp->buffer, bufferSize, MSG_DONTWAIT|MSG_TRUNC);
-    cp->methodBegin = cp->buffer;
-    cp->methodEnd = cp->buffer;
+    /* no path - default match - return default url with empty path */
+    cp->url = serverContext.url;
+    cp->urlSize = serverContext.urlSize;
     cp->pathBegin = cp->buffer;
     cp->pathEnd = cp->buffer;
     return 0;
@@ -210,10 +276,10 @@ int read_request(struct connect_params *cp)
 /* returns the first part of the response */
 const char *get_header(enum command cmd)
 {
-    if (cmd == REDIRECT || cmd == REDIRECT_HOST) {
+    if (cmd == REDIRECT) {
         return "HTTP/1.1 302 Found\r\n"
                "Location: ";
-    } else if (cmd == PERMADIRECT || cmd == PERMADIRECT_HOST) {
+    } else if (cmd == PERMADIRECT) {
         return "HTTP/1.1 301 Moved Permanently\r\n"
                "Location: ";
     }
@@ -230,7 +296,7 @@ const char *get_tailer()
 }
 
 /* print statistics */
-void printStats()
+void print_stats()
 {
     if (!noStatistics) {
         printf("+%lus: %lu requests (%lu successes, %lu failures, %d ongoing) (%d max events, %d max conns)\n",
@@ -276,13 +342,13 @@ int send_response(struct connect_params *cp)
     int rc;
 
     /* send response */
-    if (server_context.headerSize > cp->headerSent) {
-        rc = send_part(cp->fd, server_context.header, server_context.headerSize, &(cp->headerSent), 0);
+    if (serverContext.headerSize > cp->headerSent) {
+        rc = send_part(cp->fd, serverContext.header, serverContext.headerSize, &(cp->headerSent), 0);
         if (rc != 0) return rc;
     }
 
-    if (server_context.urlSize > cp->urlSent) {
-        rc = send_part(cp->fd, server_context.url, server_context.urlSize, &(cp->urlSent), 0);
+    if (cp->urlSize > cp->urlSent) {
+        rc = send_part(cp->fd, cp->url, cp->urlSize, &(cp->urlSent), 0);
         if (rc != 0) return rc;
     }
 
@@ -292,8 +358,8 @@ int send_response(struct connect_params *cp)
         if (rc != 0) return rc;
     }
 
-    if (server_context.tailerSize > cp->tailerSent) {
-        rc = send_part(cp->fd, server_context.tailer, server_context.tailerSize, &(cp->tailerSent), 1);
+    if (serverContext.tailerSize > cp->tailerSent) {
+        rc = send_part(cp->fd, serverContext.tailer, serverContext.tailerSize, &(cp->tailerSent), 1);
         if (rc != 0) return rc;
     }
 
@@ -314,16 +380,19 @@ void free_connect(struct connect_params *cp)
 }
 
 /* http server */
-noreturn void server(int port, enum command cmd, const char *url)
+noreturn void server(int port, enum command cmd, const char *url, bool append, struct match_params *pathMatch, int matches)
 {
     /* prepare shared read-only server context for all threads */
-    server_context.cmd = cmd;
-    server_context.header = get_header(cmd);
-    server_context.headerSize = strlen(server_context.header);
-    server_context.url = url;
-    server_context.urlSize = strlen(url);
-    server_context.tailer = get_tailer();
-    server_context.tailerSize = strlen(server_context.tailer);
+    serverContext.cmd = cmd;
+    serverContext.append = append;
+    serverContext.header = get_header(cmd);
+    serverContext.headerSize = strlen(serverContext.header);
+    serverContext.url = url;
+    serverContext.urlSize = strlen(url);
+    serverContext.tailer = get_tailer();
+    serverContext.tailerSize = strlen(serverContext.tailer);
+    serverContext.pathMatch = pathMatch;
+    serverContext.matches = matches;
 
     startTime = time(NULL);
 
@@ -356,7 +425,7 @@ noreturn void server(int port, enum command cmd, const char *url)
         if (count == 0) {
             /* timeout */
             if (maxEvents > 0) {
-                printStats();
+                print_stats();
             }
             continue;
         }
@@ -407,7 +476,7 @@ noreturn void server(int port, enum command cmd, const char *url)
                     continue;
                 }
                 ++requests;
-                if ((requests % 1000) == 0) printStats();
+                if ((requests % 1000) == 0) print_stats();
                 continue;
             }
 
@@ -458,14 +527,17 @@ void printHelp()
 {
     puts("Usage: no80 [OPTION]... URL\n"
          "\n"
-         "The resource effective redirecting http server\n"
+         "The resource effective redirecting http server v" VERSION_STR "\n"
          "\n"
          "Options:\n"
-         "  -a    Append path from the http request to the redirected URL\n"
-         "  -h    Print this help text and exit\n"
-         "  -p N  Use specified port number N (default is port 80)\n"
-         "  -P    Redirect permanently using 301 instead of temporarily using 302\n"
-         "  -q    Suppress statistics");
+         "  -a           Append path from the http request to the redirected URL\n"
+         "  -h           Print this help text and exit\n"
+         "  -m PATH URL  Redirect path matching with PATH to URL\n"
+         "  -s PATH URL  Redirect path starting with PATH to URL\n"
+         "  -r PATH URL  Redirect path starting with PATH to URL appended with the rest of the path\n"
+         "  -p N         Use specified port number N (default is port 80)\n"
+         "  -P           Redirect permanently using 301 instead of temporarily using 302\n"
+         "  -q           Suppress statistics");
 }
 
 int main(int argc, char **argv)
@@ -482,6 +554,7 @@ int main(int argc, char **argv)
     bool option_a = 0;
     int port = 80;
     const char *url = NULL;
+    int matches = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-P") == 0) {
@@ -501,7 +574,34 @@ int main(int argc, char **argv)
                 puts("Missing port number");
                 return 1;
             }
-        } else if (strcmp(argv[i], "-h") == 0) {
+        } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "-r") == 0) {
+            bool matchAppend = (argv[i][1] == 'r');
+            bool matchBegin = (argv[i][1] != 'm');
+            if (++i < argc) {
+                const char *m = argv[i];
+                if (++i < argc) {
+                    const char *u = argv[i];
+                    if (matches < MAX_MATCHES - 1) {
+                        pathMatch[matches].path = m;
+                        pathMatch[matches].pathSize = strlen(m);
+                        pathMatch[matches].url = u;
+                        pathMatch[matches].urlSize = strlen(u);
+                        pathMatch[matches].append = matchAppend;
+                        pathMatch[matches].begin = matchBegin;
+                        ++matches;
+                    } else {
+                        puts("Too many match parameters");
+                        return 1;
+                    }
+                } else {
+                    puts("Missing match target url");
+                    return 1;
+                }
+            } else {
+                puts("Missing match path");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printHelp();
             return 1;
        } else if (!url) {
@@ -509,22 +609,22 @@ int main(int argc, char **argv)
        } else {
             printf("Invalid parameter %s\n", argv[i]);
             return 1;
-        }
+       }
     }
     if (!url) {
         puts("Missing URL parameter");
         return 1;
     }
 
-    enum command cmd = (option_P ? PERMADIRECT : REDIRECT) | (option_a ? REDIRECT_HOST : REDIRECT);
+    enum command cmd = (option_P ? PERMADIRECT : REDIRECT);
+    bool append = (option_a ? 1 : 0);
 
-    puts("no80 v" VERSION_STR " - The resource effective redirecting http server");
-
-    printf("Redirecting port %d requests %s to %s%s\n",
+    printf("no80 - The resource effective redirecting http server v" VERSION_STR "\n"
+           "Redirecting port %d requests %s to url %s%s\n",
         port,
         ( option_P ? "permanently (301)" : "temporarily (302)"),
         url,
         ( option_a ? "</path>" : ""));
 
-    server(port, cmd, url);
+    server(port, cmd, url, append, pathMatch, matches);
 }

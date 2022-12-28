@@ -1,3 +1,15 @@
+/*
+ * no80 - https://github.com/malafoss/no80
+ *
+ * Copyright (c) 2022 Mikko Ala-Fossi
+ *
+ * Licensed under MIT license
+ */
+#define STR(s) #s
+#define STR_EVAL(e) STR(e)
+#define VERSION_STR STR_EVAL(VERSION)
+const char *plate_text = "The resource effective redirecting http server v" VERSION_STR;
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,11 +27,8 @@
 #include <stdnoreturn.h>
 #include <sys/epoll.h>
 
+/* Environment assumptions */
 static_assert(EAGAIN == EWOULDBLOCK);
-
-#define STR(s) #s
-#define STR_EVAL(e) STR(e)
-#define VERSION_STR STR_EVAL(VERSION)
 
 /* TCP parameters */
 #define QUEUE_LENGTH 1000
@@ -523,21 +532,22 @@ noreturn void server(int port, enum command cmd, const char *url, bool append, s
 }
 
 /* print help text */
-void printHelp()
+void print_help()
 {
-    puts("Usage: no80 [OPTION]... URL\n"
-         "\n"
-         "The resource effective redirecting http server v" VERSION_STR "\n"
-         "\n"
-         "Options:\n"
-         "  -a           Append path from the http request to the redirected URL\n"
-         "  -h           Print this help text and exit\n"
-         "  -m PATH URL  Redirect path matching with PATH to URL\n"
-         "  -s PATH URL  Redirect path starting with PATH to URL\n"
-         "  -r PATH URL  Redirect path starting with PATH to URL appended with the rest of the path\n"
-         "  -p N         Use specified port number N (default is port 80)\n"
-         "  -P           Redirect permanently using 301 instead of temporarily using 302\n"
-         "  -q           Suppress statistics");
+    printf("Usage: no80 [OPTION]... URL\n"
+           "\n"
+           "%s\n"
+           "\n"
+           "Options:\n"
+           "  -a           Append path from the http request to the redirected URL\n"
+           "  -h           Print this help text and exit\n"
+           "  -m PATH URL  Redirect path matching with PATH to URL\n"
+           "  -s PATH URL  Redirect path starting with PATH to URL\n"
+           "  -r PATH URL  Redirect path starting with PATH to URL appended with the rest of the path\n"
+           "  -p N         Use specified port number N (default is port 80)\n"
+           "  -P           Redirect permanently using 301 instead of temporarily using 302\n"
+           "  -q           Suppress statistics\n",
+        plate_text);
 }
 
 int main(int argc, char **argv)
@@ -546,7 +556,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, interrupted);
 
     if (argc < 2) {
-        printHelp();
+        print_help();
         return 1;
     }
 
@@ -582,6 +592,10 @@ int main(int argc, char **argv)
                 if (++i < argc) {
                     const char *u = argv[i];
                     if (matches < MAX_MATCHES - 1) {
+                        if (m[0] != '/') {
+                            puts("Path should start with /");
+                            return 1;
+                        }
                         pathMatch[matches].path = m;
                         pathMatch[matches].pathSize = strlen(m);
                         pathMatch[matches].url = u;
@@ -602,7 +616,10 @@ int main(int argc, char **argv)
                 return 1;
             }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printHelp();
+            print_help();
+            return 1;
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("no80 - %s\n", plate_text);
             return 1;
        } else if (!url) {
             url = argv[i];
@@ -619,12 +636,22 @@ int main(int argc, char **argv)
     enum command cmd = (option_P ? PERMADIRECT : REDIRECT);
     bool append = (option_a ? 1 : 0);
 
-    printf("no80 - The resource effective redirecting http server v" VERSION_STR "\n"
-           "Redirecting port %d requests %s to url %s%s\n",
+    printf("no80 - %s\n"
+           "Redirecting port %d requests %s\n",
+        plate_text,
         port,
-        ( option_P ? "permanently (301)" : "temporarily (302)"),
+        ( option_P ? "permanently (301)" : "temporarily (302)"));
+
+    for (int i = 0; i < matches; i++)
+        printf("  Path %s%s to URL %s%s\n",
+            pathMatch[i].path,
+            (pathMatch[i].begin ? "*" : ""),
+            pathMatch[i].url,
+            (pathMatch[i].append ? "*" : ""));
+
+    printf("  Path * to URL %s%s\n",
         url,
-        ( option_a ? "</path>" : ""));
+        ( option_a ? "*" : ""));
 
     server(port, cmd, url, append, pathMatch, matches);
 }

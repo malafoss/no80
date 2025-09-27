@@ -1,7 +1,7 @@
 /*
  * no80 - https://github.com/malafoss/no80
  *
- * Copyright (c) 2022 Mikko Ala-Fossi
+ * Copyright (c) 2025 Mikko Ala-Fossi
  *
  * Licensed under MIT license
  */
@@ -27,6 +27,11 @@ const char *plate_text = "The resource effective redirecting http server v" VERS
 #include <stdnoreturn.h>
 #include <sys/epoll.h>
 
+#include <wolfssl/options.h>
+#include <wolfssl/ssl.h>
+#include <wolfssl/wolfcrypt/settings.h>
+#include <wolfssl/error-ssl.h>
+
 /* Environment assumptions */
 static_assert(EAGAIN == EWOULDBLOCK);
 
@@ -38,8 +43,8 @@ static_assert(EAGAIN == EWOULDBLOCK);
 
 /* Max HTTP protocol element sizes */
 #define MAX_METHOD 10
-#define MAX_PATH 8000
-static_assert(BUFFER_SIZE > MAX_METHOD + MAX_PATH + 128);
+#define MAX_HTTP_PATH 8000
+static_assert(BUFFER_SIZE > MAX_METHOD + MAX_HTTP_PATH + 128);
 
 /* Epoll parameters */
 #define MAX_EPOLL_CREATES 256
@@ -52,15 +57,29 @@ enum command { REDIRECT = 0, PERMADIRECT = 1 };
 /* maximum number of matched path redirections */
 #define MAX_MATCHES 256
 
-/* globals for statistics */
-bool noStatistics = 0;
-time_t startTime;
-unsigned long requests = 0;
-unsigned long successes = 0;
-unsigned long completed = 0;
-int connections = -1; /* ignore efd */
-int maxConns = 0;
-int maxEvents = 0;
+/* statistics structure */
+struct statistics {
+    bool noStatistics;
+    time_t startTime;
+    unsigned long requests;
+    unsigned long successes;
+    unsigned long completed;
+    int connections; /* ignore efd */
+    int maxConns;
+    int maxEvents;
+};
+
+/* global statistics instance */
+static struct statistics stats = {
+    .noStatistics = false,
+    .startTime = 0,
+    .requests = 0,
+    .successes = 0,
+    .completed = 0,
+    .connections = -1,
+    .maxConns = 0,
+    .maxEvents = 0
+};
 
 /* signal handler SIGINTR and SIGTERM */
 noreturn void interrupted(int sig)
@@ -68,22 +87,28 @@ noreturn void interrupted(int sig)
     _exit(0); /* handler safe exit closes open sockets */
 }
 
+/* fatal error handler */
+static noreturn void fatal_error(const char *msg)
+{
+    perror(msg);
+    exit(2);
+}
+
+
 /* returns listen socket fd */
 int listen_socket(int port)
 {
     /* prepare socket */
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
-        perror("socket");
-        exit(2);
+        fatal_error("socket");
     }
 
     /* enable address reusage */
     {
         int option = 1; /* enable */
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option))) {
-            perror("setsockopt");
-            exit(2);
+            fatal_error("setsockopt");
         }
     }
 
@@ -91,8 +116,7 @@ int listen_socket(int port)
     {
         int option = 1; /* enable */
         if (setsockopt(fd, SOL_TCP, TCP_NODELAY, &option, sizeof(option))) {
-            perror("setsockopt");
-            exit(2);
+            fatal_error("setsockopt");
         }
     }
 
@@ -104,15 +128,13 @@ int listen_socket(int port)
         address.sin_addr.s_addr = INADDR_ANY;
         address.sin_port = htons(port);
         if (bind(fd, (struct sockaddr*)&address, sizeof(address)) == -1) {
-            perror("bind");
-            exit(2);
+            fatal_error("bind");
         }
     }
 
     /* list the port */
     if (listen(fd, QUEUE_LENGTH) == -1) {
-        perror("listen");
-        exit(2);
+        fatal_error("listen");
     }
 
     return fd;
@@ -166,7 +188,124 @@ struct connect_params {
     int urlSent;
     int pathSent;
     int tailerSent;
+
+    /* SSL parameters */
+    WOLFSSL *ssl;
+    bool is_ssl;
 };
+
+/* epoll helper functions */
+static int epoll_add_connection(int efd, struct connect_params *cp)
+{
+    if (epoll_ctl(efd, EPOLL_CTL_ADD, cp->fd, &(cp->ee)) < 0) {
+        perror("epoll_ctl add");
+        return -1;
+    }
+    return 0;
+}
+
+static void epoll_remove_connection(int efd, int fd)
+{
+    if (epoll_ctl(efd, EPOLL_CTL_DEL, fd, NULL) < 0) {
+        perror("epoll_ctl del");
+    }
+}
+
+/* SSL error handling helper */
+static int handle_ssl_error(WOLFSSL *ssl, int ret)
+{
+    int err = wolfSSL_get_error(ssl, ret);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        return -2; // EAGAIN equivalent
+    }
+    return -1; // Other error
+}
+
+/* forward declaration */
+void free_connect(struct connect_params *cp);
+
+/* connection cleanup helper */
+static void cleanup_connection(int efd, struct connect_params *cp)
+{
+    epoll_remove_connection(efd, cp->fd);
+    free_connect(cp);
+}
+
+/* SSL context */
+static WOLFSSL_CTX *ssl_ctx = NULL;
+
+/* Initialize WolfSSL */
+int init_wolfssl(const char *cert_file, const char *key_file)
+{
+    /* Initialize wolfSSL with debugging */
+    /* wolfSSL_Debugging_ON(); */
+    wolfSSL_Init();
+    
+    /* Create and initialize WOLFSSL_CTX - Try TLS 1.3 first, fallback to TLS 1.2 */
+    ssl_ctx = wolfSSL_CTX_new(wolfTLSv1_3_server_method());
+    if (ssl_ctx == NULL) {
+        /* TLS 1.3 not available, fallback to TLS 1.2 */
+        ssl_ctx = wolfSSL_CTX_new(wolfTLSv1_2_server_method());
+        if (ssl_ctx == NULL) {
+            fprintf(stderr, "ERROR: failed to create WOLFSSL_CTX\n");
+            return -1;
+        }
+        printf("Using TLS 1.2 (TLS 1.3 not available)\n");
+    } else {
+        printf("Using TLS 1.3\n");
+    }
+    
+    /* Set verification mode to none - accept all clients */
+    wolfSSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, 0);
+    
+    /* Ignore certificate validation errors */
+    wolfSSL_CTX_set_verify_depth(ssl_ctx, 0);
+    
+    /* Set up to ignore certificate alerts from clients */
+    wolfSSL_CTX_set_servername_callback(ssl_ctx, NULL);
+    
+    /* Disable session caching as requested */
+    wolfSSL_CTX_set_session_cache_mode(ssl_ctx, WOLFSSL_SESS_CACHE_OFF);
+    
+    /* Optimize cipher suites for performance */
+    const char* fast_ciphers = 
+        "TLS13-AES128-GCM-SHA256:"           /* TLS 1.3 fastest */
+        "TLS13-CHACHA20-POLY1305-SHA256:"    /* TLS 1.3 ChaCha20 */
+        "ECDHE-RSA-AES128-GCM-SHA256:"       /* TLS 1.2 fast ECDHE */
+        "ECDHE-RSA-CHACHA20-POLY1305";       /* TLS 1.2 ChaCha20 */
+
+    if (wolfSSL_CTX_set_cipher_list(ssl_ctx, fast_ciphers) != SSL_SUCCESS) {
+        fprintf(stderr, "WARNING: Could not set optimized cipher list, using defaults\n");
+    }
+    
+    /* Additional performance optimizations */
+    wolfSSL_CTX_set_options(ssl_ctx, WOLFSSL_OP_NO_SSLv2 | WOLFSSL_OP_NO_SSLv3);
+    wolfSSL_CTX_SetMinVersion(ssl_ctx, WOLFSSL_TLSV1_2); /* Minimum TLS 1.2 */
+    
+    /* Load server certificates */
+    if (wolfSSL_CTX_use_certificate_file(ssl_ctx, cert_file, SSL_FILETYPE_PEM) != SSL_SUCCESS) {
+        fprintf(stderr, "ERROR: failed to load certificate file %s\n", cert_file);
+        return -1;
+    }
+    
+    /* Load server key */
+    if (wolfSSL_CTX_use_PrivateKey_file(ssl_ctx, key_file, SSL_FILETYPE_PEM) != SSL_SUCCESS) {
+        fprintf(stderr, "ERROR: failed to load key file %s\n", key_file);
+        return -1;
+    }
+    
+    return 0;
+}
+
+/* Cleanup WolfSSL */
+void cleanup_wolfssl()
+{
+    if (ssl_ctx) {
+        wolfSSL_CTX_free(ssl_ctx);
+        ssl_ctx = NULL;
+    }
+    wolfSSL_Cleanup();
+}
 
 /* try finding matching path, NULL if no match */
 struct match_params *match_path(const char *p, int size)
@@ -185,6 +324,45 @@ struct match_params *match_path(const char *p, int size)
     return NULL;
 }
 
+/* SSL read - returns bytes read, -1 on error, -2 on EAGAIN */
+int ssl_read(struct connect_params *cp, char *buf, int size)
+{
+    if (!cp->ssl) return -1;
+    
+    int ret = wolfSSL_read(cp->ssl, buf, size);
+    if (ret <= 0) {
+        int ssl_result = handle_ssl_error(cp->ssl, ret);
+        if (ssl_result == -2) {
+            return -2; // EAGAIN equivalent
+        }
+        int err = wolfSSL_get_error(cp->ssl, ret);
+        if (err == -313) {
+            return -1; // Ignore -313 related to key validation
+        }
+        fprintf(stderr, "wolfSSL_read error: %d\n", err);
+        return -1;
+    }
+    return ret;
+}
+
+/* SSL write - returns bytes written, -1 on error, -2 on EAGAIN */
+int ssl_write(struct connect_params *cp, const char *buf, int size)
+{
+    if (!cp->ssl) return -1;
+    
+    int ret = wolfSSL_write(cp->ssl, buf, size);
+    if (ret <= 0) {
+        int ssl_result = handle_ssl_error(cp->ssl, ret);
+        if (ssl_result == -2) {
+            return -2; // EAGAIN equivalent
+        }
+        int err = wolfSSL_get_error(cp->ssl, ret);
+        fprintf(stderr, "wolfSSL_write error: %d\n", err);
+        return -1;
+    }
+    return ret;
+}
+
 /* read http request - 0 = OK, 1 = Call again, -1 = Error */
 int read_request(struct connect_params *cp)
 {
@@ -200,13 +378,20 @@ int read_request(struct connect_params *cp)
     while (ptr < cp->buffer + bufferSize) {
         if (ptr == cp->recvPtr) {
             /* recv more data */
-            int bytes = recv(cp->fd, cp->recvPtr, bufferSize - (cp->recvPtr - cp->buffer), MSG_DONTWAIT);
-            if (bytes == -1) {
-                if (errno == EAGAIN) return 1; // recv more later
-                perror("recv");
-                return -1;
+            int bytes;
+            
+            if (cp->is_ssl) {
+                bytes = ssl_read(cp, cp->recvPtr, bufferSize - (cp->recvPtr - cp->buffer));
+                if (bytes == -2) return 1; // EAGAIN equivalent
+            } else {
+                bytes = recv(cp->fd, cp->recvPtr, bufferSize - (cp->recvPtr - cp->buffer), MSG_DONTWAIT);
+                if (bytes == -1) {
+                    if (errno == EAGAIN) return 1; // recv more later
+                    perror("recv");
+                    return -1;
+                }
             }
-            if (bytes == 0) return -1; // needed bytes, so its error
+            if (bytes <= 0) return -1; // needed bytes, so its error
             cp->recvPtr += bytes;
         }
 
@@ -224,7 +409,7 @@ int read_request(struct connect_params *cp)
             }
         } else {
             /* in Request-URI */
-            if (ptr - cp->pathBegin > MAX_PATH || c == ' ') {
+            if (ptr - cp->pathBegin > MAX_HTTP_PATH || c == ' ') {
                 cp->pathEnd = ptr-1;
                 break;
             }
@@ -307,18 +492,20 @@ const char *get_tailer()
 /* print statistics */
 void print_stats()
 {
-    if (!noStatistics) {
+    if (!stats.noStatistics) {
         printf("+%lus: %lu requests (%lu successes, %lu failures, %d ongoing) (%d max events, %d max conns)\n",
-            time(NULL) - startTime,
-            requests,
-            successes,
-            completed - successes,
-            connections,
-            maxEvents,
-            maxConns);
+            time(NULL) - stats.startTime,
+            stats.requests,
+            stats.successes,
+            stats.completed - stats.successes,
+            stats.connections,
+            stats.maxEvents,
+            stats.maxConns);
     }
-    maxEvents = 0;
-    maxConns = 0;
+    __transaction_atomic {
+        stats.maxEvents = 0;
+        stats.maxConns = 0;
+    }
 }
 
 /* allocate new connection parameters */
@@ -328,19 +515,55 @@ struct connect_params *new_connect(int fd)
     if (!c) return NULL;
     bzero(c, sizeof(struct connect_params));
     c->fd = fd;
-    ++connections;
-    if (connections > maxConns) maxConns = connections;
+    __transaction_atomic {
+        ++stats.connections;
+        if (stats.connections > stats.maxConns) stats.maxConns = stats.connections;
+    }
     return c;
 }
 
-int send_part(int fd, const char *msg, int msgsize, int *sent, bool last)
+/* Setup SSL for a connection */
+int setup_ssl_connection(struct connect_params *cp)
 {
-    int rc = send(fd, msg + *sent, msgsize - *sent, MSG_DONTWAIT | (last ? 0 : MSG_MORE));
-    if (rc < 0) {
-        if (errno == EAGAIN) return 1;
-        perror("send");
+    if (!ssl_ctx) return -1;
+    
+    /* Create a new SSL object */
+    if ((cp->ssl = wolfSSL_new(ssl_ctx)) == NULL) {
+        fprintf(stderr, "ERROR: failed to create WOLFSSL object\n");
         return -1;
     }
+    
+    /* Associate the socket with the SSL object */
+    if (wolfSSL_set_fd(cp->ssl, cp->fd) != SSL_SUCCESS) {
+        fprintf(stderr, "ERROR: failed to set socket to SSL object\n");
+        wolfSSL_free(cp->ssl);
+        cp->ssl = NULL;
+        return -1;
+    }
+    
+    /* Mark this connection as SSL */
+    cp->is_ssl = true;
+    
+    return 0;
+}
+
+int send_part(struct connect_params *cp, const char *msg, int msgsize, int *sent, bool last)
+{
+    int rc;
+    
+    if (cp->is_ssl) {
+        rc = ssl_write(cp, msg + *sent, msgsize - *sent);
+        if (rc == -2) return 1; // EAGAIN equivalent
+        if (rc < 0) return -1;
+    } else {
+        rc = send(cp->fd, msg + *sent, msgsize - *sent, MSG_DONTWAIT | (last ? 0 : MSG_MORE));
+        if (rc < 0) {
+            if (errno == EAGAIN) return 1;
+            perror("send");
+            return -1;
+        }
+    }
+    
     *sent += rc;
     return 0;
 }
@@ -352,27 +575,31 @@ int send_response(struct connect_params *cp)
 
     /* send response */
     if (serverContext.headerSize > cp->headerSent) {
-        rc = send_part(cp->fd, serverContext.header, serverContext.headerSize, &(cp->headerSent), 0);
+        rc = send_part(cp, serverContext.header, serverContext.headerSize, &(cp->headerSent), 0);
         if (rc != 0) return rc;
     }
 
     if (cp->urlSize > cp->urlSent) {
-        rc = send_part(cp->fd, cp->url, cp->urlSize, &(cp->urlSent), 0);
+        rc = send_part(cp, cp->url, cp->urlSize, &(cp->urlSent), 0);
         if (rc != 0) return rc;
     }
 
     int pathSize = cp->pathEnd - cp->pathBegin;
     if (pathSize > cp->pathSent) {
-        rc = send_part(cp->fd, cp->pathBegin, pathSize, &(cp->pathSent), 0);
+        rc = send_part(cp, cp->pathBegin, pathSize, &(cp->pathSent), 0);
         if (rc != 0) return rc;
     }
 
     if (serverContext.tailerSize > cp->tailerSent) {
-        rc = send_part(cp->fd, serverContext.tailer, serverContext.tailerSize, &(cp->tailerSent), 1);
+        rc = send_part(cp, serverContext.tailer, serverContext.tailerSize, &(cp->tailerSent), 1);
         if (rc != 0) return rc;
     }
 
     /* tear down */
+    if (cp->is_ssl) {
+        /* Properly shutdown the SSL connection */
+        wolfSSL_shutdown(cp->ssl);
+    }
     shutdown(cp->fd, SHUT_RDWR);
     return 0;
 }
@@ -381,15 +608,21 @@ int send_response(struct connect_params *cp)
 void free_connect(struct connect_params *cp)
 {
     if (cp) {
+        if (cp->ssl) {
+            wolfSSL_shutdown(cp->ssl);
+            wolfSSL_free(cp->ssl);
+        }
         close(cp->fd);
         free(cp);
     }
-    --connections;
-    ++completed;
+    __transaction_atomic {
+        --stats.connections;
+        ++stats.completed;
+    }
 }
 
-/* http server */
-noreturn void server(int port, enum command cmd, const char *url, bool append, struct match_params *pathMatch, int matches)
+/* http/https server */
+noreturn void server(int port, enum command cmd, const char *url, bool append, struct match_params *pathMatch, int matches, bool is_ssl)
 {
     /* prepare shared read-only server context for all threads */
     serverContext.cmd = cmd;
@@ -403,23 +636,21 @@ noreturn void server(int port, enum command cmd, const char *url, bool append, s
     serverContext.pathMatch = pathMatch;
     serverContext.matches = matches;
 
-    startTime = time(NULL);
+    stats.startTime = time(NULL);
 
     /* prepare listen socket */
     const int fd = listen_socket(port);
 
     const int efd = epoll_create(MAX_EPOLL_CREATES);
     if (efd == -1) {
-        perror("epoll_create");
-        exit(2);
+        fatal_error("epoll_create");
     }
 
     struct epoll_event ee;
     ee.events = EPOLLIN;
     ee.data.ptr = new_connect(fd);
     if (epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ee) < 0) {
-        perror("epoll_ctl");
-        exit(2);
+        fatal_error("epoll_ctl");
     }
 
     struct epoll_event ees[MAX_EPOLL_EVENTS];
@@ -428,17 +659,18 @@ noreturn void server(int port, enum command cmd, const char *url, bool append, s
     while (1) {
         int count = epoll_wait(efd, ees, sizeof(ees)/sizeof(ees[0]), EPOLL_TIMEOUT_MS);
         if (count == -1) {
-            perror("epoll_wait");
-            exit(2);
+            fatal_error("epoll_wait");
         }
         if (count == 0) {
             /* timeout */
-            if (maxEvents > 0) {
+            if (stats.maxEvents > 0) {
                 print_stats();
             }
             continue;
         }
-        if (count > maxEvents) maxEvents = count;
+        __transaction_atomic {
+            if (count > stats.maxEvents) stats.maxEvents = count;
+        }
 
         for (int i = 0; i < count; i++) {
             struct connect_params *cp = (struct connect_params *)ees[i].data.ptr;
@@ -467,8 +699,7 @@ noreturn void server(int port, enum command cmd, const char *url, bool append, s
                         perror("accept");
                         continue;
                     default:
-                        perror("accept");
-                        exit(2);
+                        fatal_error("accept");
                     }
                 }
 
@@ -477,28 +708,70 @@ noreturn void server(int port, enum command cmd, const char *url, bool append, s
 
                 /* new connection -> EPOLLIN event */
                 struct connect_params *cp = new_connect(rfd);
+                
+                /* Setup SSL if this is an SSL server */
+                if (is_ssl) {
+                    if (setup_ssl_connection(cp) < 0) {
+                        free_connect(cp);
+                        continue;
+                    }
+                    
+                    /* We'll handle the SSL handshake in the EPOLLIN event handler */
+                    /* Just add the connection to epoll for now */
+                    cp->ee.events = EPOLLIN;
+                    cp->ee.data.ptr = cp;
+                    if (epoll_add_connection(efd, cp) < 0) {
+                        free_connect(cp);
+                        continue;
+                    }
+                    continue;
+                }
+                
                 cp->ee.events = EPOLLIN;
                 cp->ee.data.ptr = cp;
-                if (epoll_ctl(efd, EPOLL_CTL_ADD, rfd, &(cp->ee)) < 0) {
-                    perror("epoll_ctl add");
+                if (epoll_add_connection(efd, cp) < 0) {
                     free_connect(cp);
                     continue;
                 }
-                ++requests;
-                if ((requests % 1000) == 0) print_stats();
+
+                bool doprint;
+                __transaction_atomic {
+                    ++stats.requests;
+                    doprint = ((stats.requests % 1000) == 0);
+                }
+                if (doprint) print_stats();
                 continue;
             }
 
             /* handle connection events */
             if (ees[i].events & EPOLLIN) {
+                /* If this is an SSL connection, perform the handshake if needed */
+                if (cp->is_ssl) {
+                    /* Try to accept the SSL connection */
+                    int ret = wolfSSL_accept(cp->ssl);
+                    if (ret != SSL_SUCCESS) {
+                        int ssl_result = handle_ssl_error(cp->ssl, ret);
+                        if (ssl_result == -2) {
+                            /* Handshake needs more data, will continue later */
+                            continue;
+                        }
+                        
+                        /* For certain errors, we can continue anyway */
+                        int err = wolfSSL_get_error(cp->ssl, ret);
+                        if (err == -313) { /* ASN_NO_SIGNER_E - Client doesn't trust our certificate */
+                            /* Continue despite the error */
+                        } else {
+                            /* For other errors, close the connection */
+                            cleanup_connection(efd, cp);
+                            continue;
+                        }
+                    }
+                }
                 /* read request */
                 int rc = read_request(cp);
                 if (rc < 0) {
                     /* failure -> delete event */
-                    if (epoll_ctl(efd, EPOLL_CTL_DEL, cp->fd, NULL) < 0) {
-                        perror("epoll_ctl del");
-                    }
-                    free_connect(cp);
+                    cleanup_connection(efd, cp);
                     continue;
                 }
                 if (rc > 0) {
@@ -519,11 +792,10 @@ noreturn void server(int port, enum command cmd, const char *url, bool append, s
                     /* send more again later */
                     continue;
                 }
-                if (rc == 0) ++successes;
-                if (epoll_ctl(efd, EPOLL_CTL_DEL, cp->fd, NULL) < 0) {
-                    perror("epoll_ctl del");
+                __transaction_atomic {
+                    if (rc == 0) ++stats.successes;
                 }
-                free_connect(cp);
+                cleanup_connection(efd, cp);
                 continue;
             }
             /* unknown event */
@@ -546,7 +818,11 @@ void print_help()
            "  -r PATH URL  Redirect path starting with PATH to URL appended with the rest of the path\n"
            "  -p N         Use specified port number N (default is port 80)\n"
            "  -P           Redirect permanently using 301 instead of temporarily using 302\n"
-           "  -q           Suppress statistics\n",
+           "  -q           Suppress statistics\n"
+           "  -S N         Use specified HTTPS port number N (default is port 443)\n"
+           "  -c FILE      SSL certificate file in PEM format (default: /certs/cert.pem)\n"
+           "  -k FILE      SSL private key file in PEM format (default: /certs/key.pem)\n"
+           ,
         plate_text);
 }
 
@@ -565,6 +841,9 @@ int main(int argc, char **argv)
     int port = 80;
     const char *url = NULL;
     int matches = 0;
+    int https_port = 443;  /* Default HTTPS port */
+    const char *cert_file = "/certs/cert.pem";  /* Default certificate file */
+    const char *key_file = "/certs/key.pem";    /* Default key file */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-P") == 0) {
@@ -572,7 +851,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-a") == 0) {
             option_a = 1;
         } else if (strcmp(argv[i], "-q") == 0) {
-            noStatistics = 1;
+            stats.noStatistics = 1;
         } else if (strcmp(argv[i], "-p") == 0) {
             if (++i < argc) {
                 port = atoi(argv[i]);
@@ -582,6 +861,31 @@ int main(int argc, char **argv)
                 }
             } else {
                 puts("Missing port number");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-S") == 0) {
+            if (++i < argc) {
+                https_port = atoi(argv[i]);
+                if (https_port < 1 || https_port > 65535) {
+                    puts("Invalid HTTPS port number specified");
+                    return 1;
+                }
+            } else {
+                puts("Missing HTTPS port number");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-c") == 0) {
+            if (++i < argc) {
+                cert_file = argv[i];
+            } else {
+                puts("Missing certificate file");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-k") == 0) {
+            if (++i < argc) {
+                key_file = argv[i];
+            } else {
+                puts("Missing key file");
                 return 1;
             }
         } else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "-r") == 0) {
@@ -637,9 +941,8 @@ int main(int argc, char **argv)
     bool append = (option_a ? 1 : 0);
 
     printf("no80 - %s\n"
-           "Redirecting port %d requests %s\n",
+           "Redirecting requests %s\n",
         plate_text,
-        port,
         ( option_P ? "permanently (301)" : "temporarily (302)"));
 
     for (int i = 0; i < matches; i++)
@@ -653,5 +956,41 @@ int main(int argc, char **argv)
         url,
         ( option_a ? "*" : ""));
 
-    server(port, cmd, url, append, pathMatch, matches);
+    /* Start HTTPS server */
+    {
+        /* Check if certificate and key files are provided */
+        if (!cert_file) {
+            puts("Missing certificate file (-c option)");
+            return 1;
+        }
+        if (!key_file) {
+            puts("Missing key file (-k option)");
+            return 1;
+        }
+        
+        /* Initialize WolfSSL */
+        if (init_wolfssl(cert_file, key_file) < 0) {
+            puts("Failed to initialize WolfSSL");
+            return 1;
+        }
+        
+        /* Start HTTPS server in a child process */
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            return 1;
+        } else if (pid == 0) {
+            /* Child process - HTTPS server */
+            printf("Starting HTTPS server on port %d\n", https_port);
+            server(https_port, cmd, url, append, pathMatch, matches, true);
+            /* Never returns */
+        }
+        
+        /* Parent process continues with HTTP server */
+    }
+
+    /* Start HTTP server */
+    printf("Starting HTTP server on port %d\n", port);
+    server(port, cmd, url, append, pathMatch, matches, false);
+    /* Never returns */
 }

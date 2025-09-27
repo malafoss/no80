@@ -1,43 +1,37 @@
 #!/bin/bash
-requests=100
-threads=200
 
-if [ $# -eq 0 ]; then
-  echo "benchmark <portno>"
-  exit 0
+# benchmark.sh - Multithreaded HTTP/HTTPS benchmark script
+# Usage: benchmark.sh <threads> <requests_per_thread> <port> <protocol> <path>
+
+if [ $# -ne 5 ]; then
+    echo "Usage: $0 <threads> <requests_per_thread> <port> <protocol> <path>"
+    exit 1
 fi
 
-if [ "$1" = "thread" ]; then
-  (for i in `seq $requests`; do echo -e "GET /asdfas/asdfas HTTP/1.1\nHost: <server>:9999\n\n" | nc -v 127.0.0.1 $2; done) 2>&1 > /dev/null
-  exit 0
-fi
+threads=$1
+requests_per_thread=$2
+port=$3
+protocol=$4
+path=$5
 
-if [ "$1" = "threads" ]; then
-  set -m
-  echo Run $threads threads $requests each
-  thread_pids=
-  for i in `seq $threads`
-  do
-    coproc ./benchmark.sh thread $2
-    thread_pids+=" $COPROC_PID"
-  done
+set -m  # Enable job control
+thread_pids=""
 
-  echo Wait threads
-  echo thread_pids=$thread_pids
-  for i in $thread_pids
-  do
-    echo wait $i
-    wait $i
-  done
-  exit 0
-fi
+# Start worker threads using coproc
+for i in $(seq 1 $threads); do
+    if [ "$protocol" = "https" ]; then
+        coproc bash -c "for j in \$(seq 1 $requests_per_thread); do curl -k -s https://localhost:$port$path > /dev/null 2>&1; done"
+    else
+        coproc bash -c "for j in \$(seq 1 $requests_per_thread); do echo -e 'GET $path HTTP/1.1\\nHost: localhost:$port\\n\\n' | nc -w 1 localhost $port > /dev/null 2>&1; done"
+    fi
+    thread_pids="$thread_pids $COPROC_PID"
+    
+    # Close file descriptors to avoid warnings
+    exec {COPROC[0]}<&-
+    exec {COPROC[1]}>&-
+done
 
-testport=$1
-
-echo Run benchmark for no80 at port $testport
-
-time ./benchmark.sh threads $testport
-echo for $requests requests in $threads threads `expr $requests \* $threads` requests in total
-echo ""
-
-echo Benchmark complete
+# Wait for all threads to complete
+for pid in $thread_pids; do
+    wait $pid 2>/dev/null
+done

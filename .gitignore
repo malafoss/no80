@@ -1,3 +1,12 @@
 *.o
 no80
 .idea
+certs
+
+# Security tokens and credentials
+dockertoken
+gittoken
+*.token
+*token*
+.env
+.env.*

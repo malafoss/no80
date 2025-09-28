@@ -1,6 +1,6 @@
 # no80
 
-no80 - The resource effective redirecting http/https server
+no80 - The resource effective HTTP and HTTPS redirect server
 
 No80 is a minimal dockerized http and https server that makes redirects temporarily (302) or permanently (301) to given URLs. A way more simple way to do http and https redirects than, for example, nginx.
 The docker image size is under 2MB and it should run fine with 32MB of memory (recommended safe limit, probably 16MB is fine).

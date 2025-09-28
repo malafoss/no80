@@ -2,11 +2,10 @@
 
 no80 - The resource effective redirecting http/https server
 
-No80 is a minimal dockerized http/https server that only makes redirects temporarily (302) or permanently (301)
-to given URLs. A way more simple way to do http/https redirects than, for example, nginx.
-The docker image size is under 4MB and it should run fine with 32MB of memory (recommended safe limit).
+No80 is a minimal dockerized http and https server that makes redirects temporarily (302) or permanently (301) to given URLs. A way more simple way to do http and https redirects than, for example, nginx.
+The docker image size is under 2MB and it should run fine with 32MB of memory (recommended safe limit, probably 16MB is fine).
 
-It can run as both HTTP and HTTPS server simultaneously, with automatic SSL certificate handling.
+It runs both HTTP and HTTPS server simultaneously, with given SSL certificates, or by default with generated self-signed certificates.
 
 ## Using container image
 
@@ -15,7 +14,7 @@ Docker repository is available at [https://hub.docker.com/r/malafoss/no80](https
 To run the latest container:
 
 ```
-<docker|podman> run --memory=32m <DOCKER_OPTIONS> -p <PORT>:80 -p <HTTPS_PORT>:443 docker.io/malafoss/no80 <OPTIONS> <URL>
+<docker|podman> run --memory=32m <DOCKER_OPTIONS> -p <PORT>:80 -p <HTTPS_PORT>:443  -v <CERTIFICATE>.pem:/certs/cert.pem -v <CERTIFICATE_KEY>.pem:/certs/key.pem docker.io/malafoss/no80 <OPTIONS> <URL>
 ```
 
 Options:
@@ -39,10 +38,10 @@ With _-P_ option, no80 will make permanent http redirects using [301](https://en
 Example 1:
 
 ```
-podman run --memory=32m -t -i --rm -p 8080:80 -p 8443:443 docker.io/malafoss/no80 https://example.com
+podman run --memory=32m -t -i --rm -p 8080:80 -p 8443:443 -v ./certs/cert.pem:/certs/cert.pem -v ./certs/key.pem:/certs/key.pem docker.io/malafoss/no80 https://example.com
 ```
 
-Runs no80 HTTP server on port 8080 and HTTPS server on port 8443. Both servers will redirect requests to https://example.com.
+Runs no80 HTTP server on port 8080 and HTTPS server on port 8443 with given certificate and certificate key. Both servers will redirect requests to https://example.com.
 
 Example 2:
 
@@ -100,6 +99,21 @@ docker run --memory=32m -t -i --rm -p 80:80 -p 443:443 docker.io/malafoss/no80 h
 ```
 
 Runs both HTTP server on port 80 and HTTPS server on port 443 simultaneously using the default self-signed certificates included in the image. Both servers will redirect requests to https://example.com.
+
+## SSL/TLS and Cipher Configuration
+
+no80 uses WolfSSL for HTTPS support with the following configuration:
+
+**TLS Versions**: TLS 1.3 (preferred) with automatic fallback to TLS 1.2 minimum
+**SSL/TLS Optimizations**: Hardware acceleration (Intel AES-NI, AVX), assembly optimizations
+
+**Cipher Suites** (in order of preference):
+- `TLS13-AES128-GCM-SHA256` - TLS 1.3 with AES-128-GCM (fastest)
+- `TLS13-CHACHA20-POLY1305-SHA256` - TLS 1.3 with ChaCha20-Poly1305
+- `ECDHE-RSA-AES128-GCM-SHA256` - TLS 1.2 with ECDHE and AES-128-GCM
+- `ECDHE-RSA-CHACHA20-POLY1305` - TLS 1.2 with ECDHE and ChaCha20-Poly1305
+
+The cipher selection prioritizes performance while maintaining strong security. AES-128-GCM is preferred for hardware-accelerated systems, while ChaCha20-Poly1305 provides excellent performance on systems without AES hardware acceleration.
 
 ## How to build?
 

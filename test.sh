@@ -1,6 +1,10 @@
 #!/bin/bash
 testport=9898
 
+# Global failure tracking
+failed_tests=()
+total_tests=0
+
 # Helper functions for test.sh
 
 # Start container with specified options
@@ -42,9 +46,10 @@ stop_container() {
 # Test HTTP redirect and report result
 test_redirect() {
     local test_name="$1"
-    local url="$2" 
+    local url="$2"
     local expected="$3"
     echo "$test_name"
+    total_tests=$((total_tests + 1))
     local response=$(curl -v "$url" 2>&1)
     if echo "$response" | grep -q "$expected"; then
         echo TEST SUCCESS
@@ -52,15 +57,17 @@ test_redirect() {
         echo TEST FAILED
         echo "Expected: $expected"
         echo "Response: $response"
+        failed_tests+=("$test_name")
     fi
 }
 
-# Test HTTPS redirect and report result  
+# Test HTTPS redirect and report result
 test_https_redirect() {
     local test_name="$1"
     local url="$2"
     local expected="$3"
     echo "$test_name"
+    total_tests=$((total_tests + 1))
     local response=$(curl -v -k "$url" 2>&1)
     if echo "$response" | grep -q "$expected"; then
         echo TEST SUCCESS
@@ -68,6 +75,7 @@ test_https_redirect() {
         echo TEST FAILED
         echo "Expected: $expected"
         echo "Response: $response"
+        failed_tests+=("$test_name")
     fi
 }
 
@@ -142,10 +150,12 @@ run_benchmark() {
     fi
     
     # Check if benchmark completed within 60 seconds
+    total_tests=$((total_tests + 1))
     if [ "$duration_s" -lt "60" ]; then
         echo "$test_name: TEST SUCCESS"
     else
         echo "$test_name: TEST FAILED (took too long: ${duration_s}s)"
+        failed_tests+=("$test_name")
     fi
 }
 
@@ -161,7 +171,13 @@ test_redirect "Test2: redirect to https://nonexistingtest.site/hello" "http://lo
 stop_container
 
 echo Test3: no redirect to https://nonexistingtest.site
-curl -vL http://localhost:$testport 2>&1 | grep "URL: 'https://nonexistingtest.site" && echo TEST FAILED || echo TEST SUCCESS
+total_tests=$((total_tests + 1))
+if curl -vL http://localhost:$testport 2>&1 | grep "URL: 'https://nonexistingtest.site" > /dev/null 2>&1; then
+    echo TEST FAILED
+    failed_tests+=("Test3: no redirect to https://nonexistingtest.site")
+else
+    echo TEST SUCCESS
+fi
 
 start_container "-p $testport:80" -m /match https://nonexistingtest.site/m -s /starting https://nonexistingtest.site/s -r /redirect https://nonexistingtest.site/r https://nonexistingtest.site
 test_redirect "Test4: redirect no match to https://nonexistingtest.site" "http://localhost:$testport" "Location: https://nonexistingtest.site"
@@ -178,13 +194,14 @@ stop_container
 # Test9: Simultaneous HTTP and HTTPS functionality
 start_container "-p $testport:80 -p $((testport+1)):443" -a https://nonexistingtest.site
 echo Test9: Simultaneous HTTP and HTTPS servers
+total_tests=$((total_tests + 1))
 # Test HTTP redirect
 if curl -vL http://localhost:$testport/testpath 2>&1 | grep -q "URL: 'https://nonexistingtest.site/testpath'"; then
     http_success=1
 else
     http_success=0
 fi
-# Test HTTPS redirect  
+# Test HTTPS redirect
 if curl -vL -k https://localhost:$((testport+1))/testpath 2>&1 | grep -q "URL: 'https://nonexistingtest.site/testpath'"; then
     https_success=1
 else
@@ -194,6 +211,7 @@ if [ "$http_success" = "1" ] && [ "$https_success" = "1" ]; then
     echo TEST SUCCESS
 else
     echo TEST FAILED - HTTP: $http_success, HTTPS: $https_success
+    failed_tests+=("Test9: Simultaneous HTTP and HTTPS servers")
 fi
 stop_container
 
@@ -210,12 +228,29 @@ stop_container
 
 # Test12: Help and version commands
 echo Test12: Help and version options
-$builder run --rm no80 -h 2>&1 | grep -q "Usage: no80" && echo "Help: TEST SUCCESS" || echo "Help: TEST FAILED"
-$builder run --rm no80 -v 2>&1 | grep -q "no80 - The resource effective redirecting http server" && echo "Version: TEST SUCCESS" || echo "Version: TEST FAILED"
+total_tests=$((total_tests + 2))
+if $builder run --rm no80 -h 2>&1 | grep -q "Usage: no80"; then
+    echo "Help: TEST SUCCESS"
+else
+    echo "Help: TEST FAILED"
+    failed_tests+=("Test12: Help option")
+fi
+if $builder run --rm no80 -v 2>&1 | grep -q "no80 - The resource effective redirecting http"; then
+    echo "Version: TEST SUCCESS"
+else
+    echo "Version: TEST FAILED"
+    failed_tests+=("Test12: Version option")
+fi
 
 # Test13: Error handling for invalid parameters
 echo Test13: Error handling for invalid port
-$builder run --rm no80 -p 99999 https://example.com 2>&1 | grep -q "Invalid port number" && echo TEST SUCCESS || echo TEST FAILED
+total_tests=$((total_tests + 1))
+if $builder run --rm no80 -p 99999 https://example.com 2>&1 | grep -q "Invalid port number"; then
+    echo TEST SUCCESS
+else
+    echo TEST FAILED
+    failed_tests+=("Test13: Error handling for invalid port")
+fi
 
 # Test14: HTTP performance benchmark
 start_container "-p $testport:80" https://nonexistingtest.site
@@ -247,6 +282,29 @@ wait $http_pid
 wait $https_pid
 
 echo "Test16: Combined HTTP/HTTPS concurrent load test: TEST SUCCESS"
+total_tests=$((total_tests + 1))
 stop_container
 
-echo Tests complete
+echo
+echo "========================================="
+echo "TEST SUMMARY"
+echo "========================================="
+echo "Total tests run: $total_tests"
+echo "Failed tests: ${#failed_tests[@]}"
+echo "Passed tests: $((total_tests - ${#failed_tests[@]}))"
+
+if [ ${#failed_tests[@]} -eq 0 ]; then
+    echo
+    echo "✅ ALL TESTS PASSED!"
+    echo "Tests complete"
+    exit 0
+else
+    echo
+    echo "❌ FAILED TESTS:"
+    for failed_test in "${failed_tests[@]}"; do
+        echo "  - $failed_test"
+    done
+    echo
+    echo "Tests complete with failures"
+    exit 1
+fi

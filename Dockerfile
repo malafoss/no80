@@ -30,7 +30,7 @@ COPY Makefile no80.c VERSION ./
 RUN make
 
 FROM scratch AS build
-LABEL org.opencontainers.image.title="no80 - The resource effective redirecting http/https server" \
+LABEL org.opencontainers.image.title="no80 - The resource effective HTTP and HTTPS redirect server" \
       org.opencontainers.image.url="https://github.com/malafoss/no80" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=compile /no80-src/no80 /

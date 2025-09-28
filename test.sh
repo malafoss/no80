@@ -235,7 +235,7 @@ else
     echo "Help: TEST FAILED"
     failed_tests+=("Test12: Help option")
 fi
-if $builder run --rm no80 -v 2>&1 | grep -q "no80 - The resource effective redirecting http"; then
+if $builder run --rm no80 -v 2>&1 | grep -q "no80 - The resource effective HTTP and HTTPS redirect server"; then
     echo "Version: TEST SUCCESS"
 else
     echo "Version: TEST FAILED"

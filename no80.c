@@ -8,7 +8,7 @@
 #define STR(s) #s
 #define STR_EVAL(e) STR(e)
 #define VERSION_STR STR_EVAL(VERSION)
-const char *plate_text = "The resource effective redirecting http and https server v" VERSION_STR;
+const char *plate_text = "The resource effective HTTP and HTTPS redirect server v" VERSION_STR;
 
 #define _GNU_SOURCE
 #include <stdio.h>

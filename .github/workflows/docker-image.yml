@@ -13,4 +13,6 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag no80:$(date +%s)
+      run: ./build.sh
+    - name: Test the Docker image
+      run: ./test.sh

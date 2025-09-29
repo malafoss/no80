@@ -23,6 +23,7 @@ const char *plate_text = "The resource effective HTTP and HTTPS redirect server 
 #include <fcntl.h>
 #include <assert.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdnoreturn.h>
 #include <sys/epoll.h>
@@ -95,11 +96,58 @@ static noreturn void fatal_error(const char *msg)
 }
 
 
-/* returns listen socket fd */
+/* returns listen socket fd with dual-stack IPv4/IPv6 support */
 int listen_socket(int port)
 {
-    /* prepare socket */
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd;
+
+    /* try IPv6 dual-stack first (accepts both IPv4 and IPv6) */
+    fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd != -1) {
+        /* enable address reusage */
+        int option = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option))) {
+            close(fd);
+            goto ipv4_fallback;
+        }
+
+        /* enable immediate send */
+        if (setsockopt(fd, SOL_TCP, TCP_NODELAY, &option, sizeof(option))) {
+            close(fd);
+            goto ipv4_fallback;
+        }
+
+        /* disable IPv6-only mode to accept IPv4 connections too */
+        int ipv6only = 0;
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6only, sizeof(ipv6only))) {
+            close(fd);
+            goto ipv4_fallback;
+        }
+
+        /* bind to IPv6 address (which will also accept IPv4) */
+        struct sockaddr_in6 address;
+        bzero(&address, sizeof(address));
+        address.sin6_family = AF_INET6;
+        address.sin6_addr = in6addr_any;
+        address.sin6_port = htons(port);
+
+        if (bind(fd, (struct sockaddr*)&address, sizeof(address)) == -1) {
+            close(fd);
+            goto ipv4_fallback;
+        }
+
+        /* start listening */
+        if (listen(fd, QUEUE_LENGTH) == -1) {
+            close(fd);
+            goto ipv4_fallback;
+        }
+
+        return fd;
+    }
+
+ipv4_fallback:
+    /* fallback to IPv4-only if IPv6 failed */
+    fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
         fatal_error("socket");
     }

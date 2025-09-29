@@ -1,5 +1,6 @@
 FROM docker.io/gcc:15-trixie AS compile
 WORKDIR /no80-src
+
 # Install dependencies for building WolfSSL
 RUN apt-get update && apt-get install -y \
     git \
@@ -15,7 +16,7 @@ RUN git clone --depth 1 https://github.com/wolfSSL/wolfssl.git \
     && cd wolfssl \
     && ./autogen.sh \
     && ./configure --enable-static --disable-shared --enable-tls13 \
-        --enable-asm --enable-sp-asm --enable-intelasm --enable-aesni \
+        --enable-asm --enable-sp-asm --enable-intelasm --enable-armasm --enable-aesni \
         --disable-examples --disable-crypttests \
     && make \
     && make install \
@@ -24,7 +25,7 @@ RUN git clone --depth 1 https://github.com/wolfSSL/wolfssl.git \
 
 # Generate self-signed certificates
 RUN mkdir -p /certs \
-    && openssl req -x509 -newkey rsa:2048 -keyout /certs/key.pem -out /certs/cert.pem -days 3650 -nodes -subj "/CN=localhost"
+    && openssl req -x509 -newkey rsa:2048 -keyout /certs/key.pem -out /certs/cert.pem -days 3650 -nodes -subj "/CN=localhost" -addext "subjectAltName = DNS:localhost, DNS:host.containers.internal"
 
 COPY Makefile no80.c VERSION ./
 RUN make

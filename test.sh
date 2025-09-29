@@ -285,6 +285,36 @@ echo "Test16: Combined HTTP/HTTPS concurrent load test: TEST SUCCESS"
 total_tests=$((total_tests + 1))
 stop_container
 
+# Test17: IPv4-only connectivity
+echo Test17: IPv4-only redirect functionality
+start_container "-p $testport:80" "https://nonexistingtest.site"
+total_tests=$((total_tests + 1))
+response=$(curl -4 -v http://localhost:$testport/ 2>&1)
+if echo "$response" | grep -q "Location: https://nonexistingtest.site" && echo "$response" | grep -q "127.0.0.1:$testport"; then
+    echo "TEST SUCCESS"
+else
+    echo "TEST FAILED"
+    echo "Expected: Location: https://nonexistingtest.site and IPv4 connection to 127.0.0.1"
+    echo "Response: $response"
+    failed_tests+=("Test17: IPv4-only redirect functionality")
+fi
+stop_container
+
+# Test18: IPv6-only connectivity
+echo Test18: IPv6-only redirect functionality
+start_container "-p $testport:80" "https://nonexistingtest.site"
+total_tests=$((total_tests + 1))
+response=$(curl -6 -v http://localhost:$testport/ 2>&1)
+if echo "$response" | grep -q "Location: https://nonexistingtest.site" && echo "$response" | grep -q "\[::1\]:$testport"; then
+    echo "TEST SUCCESS"
+else
+    echo "TEST FAILED"
+    echo "Expected: Location: https://nonexistingtest.site and IPv6 connection to [::1]"
+    echo "Response: $response"
+    failed_tests+=("Test18: IPv6-only redirect functionality")
+fi
+stop_container
+
 echo
 echo "========================================="
 echo "TEST SUMMARY"

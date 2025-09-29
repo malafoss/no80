@@ -12,12 +12,23 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Build WolfSSL from source with static library
+ARG TARGETPLATFORM
 RUN git clone --depth 1 https://github.com/wolfSSL/wolfssl.git \
     && cd wolfssl \
     && ./autogen.sh \
-    && ./configure --enable-static --disable-shared --enable-tls13 \
-        --enable-asm --enable-sp-asm --enable-intelasm --enable-armasm --enable-aesni \
-        --disable-examples --disable-crypttests \
+    && if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        ./configure --enable-static --disable-shared --enable-tls13 \
+            --enable-asm --enable-sp-asm --enable-armasm \
+            --disable-examples --disable-crypttests; \
+       elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+        ./configure --enable-static --disable-shared --enable-tls13 \
+            --enable-asm --enable-sp-asm --enable-intelasm --enable-aesni \
+            --disable-examples --disable-crypttests; \
+       else \
+        ./configure --enable-static --disable-shared --enable-tls13 \
+            --enable-asm --enable-sp-asm \
+            --disable-examples --disable-crypttests; \
+       fi \
     && make \
     && make install \
     && cd .. \

@@ -1,5 +1,9 @@
 #!/bin/bash
 testport=9898
+run_options="$*"
+if [ "$run_options" = "" ]; then
+  run_options="no80"
+fi
 
 # Global failure tracking
 failed_tests=()
@@ -11,10 +15,10 @@ total_tests=0
 start_container() {
     local options="$1"
     shift  # Remove the first argument (options)
-    echo "Starting no80 container with: $options"
+    echo "Starting no80 container with: $options $run_options"
     $builder stop -i no80test 2>/dev/null || true
     $builder rm -i no80test 2>/dev/null || true
-    $builder run --name no80test -d --memory=32m $options no80 "$@"
+    $builder run --name no80test -d --memory=32m $options $run_options "$@"
     
     # Wait for server to be ready by testing actual HTTP response
     local port=$(echo "$options" | grep -o '\-p [0-9]*:' | head -1 | cut -d' ' -f2 | cut -d':' -f1)
@@ -229,13 +233,13 @@ stop_container
 # Test12: Help and version commands
 echo Test12: Help and version options
 total_tests=$((total_tests + 2))
-if $builder run --rm no80 -h 2>&1 | grep -q "Usage: no80"; then
+if $builder run --rm $run_options -h 2>&1 | grep -q "Usage: no80"; then
     echo "Help: TEST SUCCESS"
 else
     echo "Help: TEST FAILED"
     failed_tests+=("Test12: Help option")
 fi
-if $builder run --rm no80 -v 2>&1 | grep -q "no80 - The resource effective HTTP and HTTPS redirect server"; then
+if $builder run --rm $run_options -v 2>&1 | grep -q "no80 - The resource effective HTTP and HTTPS redirect server"; then
     echo "Version: TEST SUCCESS"
 else
     echo "Version: TEST FAILED"
@@ -245,7 +249,7 @@ fi
 # Test13: Error handling for invalid parameters
 echo Test13: Error handling for invalid port
 total_tests=$((total_tests + 1))
-if $builder run --rm no80 -p 99999 https://example.com 2>&1 | grep -q "Invalid port number"; then
+if $builder run --rm $run_options -p 99999 https://example.com 2>&1 | grep -q "Invalid port number"; then
     echo TEST SUCCESS
 else
     echo TEST FAILED
